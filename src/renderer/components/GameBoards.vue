@@ -2,7 +2,10 @@
   <!-- All components but menubar -->
   <div id="inner">
     <div>
-      <div class="main-grid">
+      <div
+        class="main-grid"
+        @wheel.exact="routeWheelToRightPanel"
+      >
         <div class="chessboard-grid">
           <div class="board-grid">
             <div class="board">
@@ -160,7 +163,8 @@ export default {
     return {
       positionInfo: '',
       game: null,
-      resetAnalysis: false
+      resetAnalysis: false,
+      keydownHandler: null
     }
   },
   computed: {
@@ -202,9 +206,12 @@ export default {
     ...mapGetters(['QuickTourIndex'])
   },
   mounted () { // EventListener für Keyboardinput, ruft direkt die jeweilige Methode auf
-    window.addEventListener('keydown', (event) => {
+    this.keydownHandler = (event) => {
       const keyName = event.key
-      if (event.target.nodeName.toLowerCase() !== 'input' || event.target.type.toLowerCase() === 'checkbox') {
+      const target = event.target
+      const tag = target && target.nodeName ? target.nodeName.toLowerCase() : ''
+      const isEditable = target && (target.isContentEditable || tag === 'textarea' || tag === 'select' || (tag === 'input' && target.type.toLowerCase() !== 'checkbox'))
+      if (!isEditable) {
         if (keyName === 'ArrowUp') {
           event.preventDefault()
           this.moveToStart()
@@ -229,8 +236,41 @@ export default {
           event.preventDefault()
           this.openPrevGame()
         }
+        if (event.ctrlKey && keyName.toLowerCase() === 'a') {
+          event.preventDefault()
+          this.$store.dispatch('toggleAnalysisMode')
+        }
+        if (event.ctrlKey && keyName.toLowerCase() === 'e') {
+          event.preventDefault()
+          this.$store.dispatch('toggleEditorMode')
+        }
+        if (keyName === 'F2') {
+          event.preventDefault()
+          this.flipBoard()
+        }
+        if (event.ctrlKey && keyName.toLowerCase() === 'g') {
+          event.preventDefault()
+          this.$store.dispatch('analysisVisualization', {
+            realtimeGameCommentary: !this.$store.getters.analysisVisualization.realtimeGameCommentary
+          })
+        }
+        if (event.ctrlKey && keyName.toLowerCase() === 'w') {
+          event.preventDefault()
+          this.$store.dispatch('playSingleEngineMove')
+        }
+        if (event.ctrlKey && keyName.toLowerCase() === 't') {
+          event.preventDefault()
+          const autoPlayBtn = document.getElementById('engine-auto-play-btn')
+          if (autoPlayBtn) autoPlayBtn.click()
+        }
       }
-    }, false)
+    }
+    window.addEventListener('keydown', this.keydownHandler, false)
+  },
+  beforeDestroy () {
+    if (this.keydownHandler) {
+      window.removeEventListener('keydown', this.keydownHandler, false)
+    }
   },
   methods: {
     setFenSize () {
@@ -242,6 +282,23 @@ export default {
       } else {
         this.moveForwardOne()
       }
+    },
+    rightPanelScrollTarget () {
+      const visibleTab = this.$el.querySelector('#right-column .tab.visible')
+      if (!visibleTab) return null
+      const style = window.getComputedStyle(visibleTab)
+      const canScrollSelf = /(auto|scroll)/.test(style.overflowY) && visibleTab.scrollHeight > visibleTab.clientHeight
+      if (canScrollSelf) return visibleTab
+      return visibleTab.querySelector('.analysis, .settings') || visibleTab
+    },
+    routeWheelToRightPanel (event) {
+      const target = event.target
+      if (!target || target.closest('.scrollable') || target.closest('#right-column')) return
+      if (target.closest('input, textarea, select, button')) return
+      const scrollTarget = this.rightPanelScrollTarget()
+      if (!scrollTarget || scrollTarget.scrollHeight <= scrollTarget.clientHeight) return
+      event.preventDefault()
+      scrollTarget.scrollTop += event.deltaY
     },
     moveToStart () { // this method returns to the starting point of the current line
       this.$store.dispatch('fen', this.startFen)
@@ -411,16 +468,20 @@ export default {
 .main-grid {
   display: grid;
   grid-template-columns: minmax(45%, 1fr) minmax(30%, 1fr);
-  grid-template-rows: auto auto auto;
+  grid-template-rows: auto minmax(0, 1fr);
   column-gap: 28px;
+  height: calc(100vh - 25px);
+  overflow: hidden;
   padding-right: 12px;
   grid-template-areas:
     "chessboard analysisview"
-    "evalplot analysisview"
     "evalplot analysisview";
 }
 .chessboard-grid {
   grid-area: chessboard;
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: auto auto auto;
@@ -462,8 +523,11 @@ export default {
 #right-column {
   grid-area: analysisview;
   width: 100%;
+  height: 100%;
+  min-height: 0;
   max-height: calc(100vh - 25px);
   min-width: 0;
+  overflow: hidden;
   padding-left: 16px;
   box-sizing: border-box;
 }
@@ -560,10 +624,13 @@ input {
 }
 #evalplot {
   grid-area: evalplot;
+  align-self: start;
   width: 100%;
   max-width: none;
+  max-height: 100%;
   margin-top: 12px;
   margin-left: 12px;
+  overflow: hidden;
 }
 #evalplot-qt {
   grid-area: evalplot;
@@ -586,8 +653,20 @@ input {
       "evalplot"
       "analysisview";
   }
+  .main-grid {
+    height: auto;
+    min-height: calc(100vh - 25px);
+    overflow: visible;
+  }
+  .chessboard-grid {
+    position: sticky;
+    top: 0;
+  }
   #right-column {
+    height: auto;
     max-height: none;
+    overflow: visible;
+    padding-left: 0;
   }
 }
 

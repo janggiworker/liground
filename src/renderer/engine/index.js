@@ -42,8 +42,21 @@ export class Engine extends EventEmitter {
     // second thread for evaluation only
     /** @type {Worker} */
     this.evalWorker = new EngineWorker()
+    this.deepAnalysisActive = false
     this.evalWorker.addEventListener('message', ({ data }) => {
-      if (data.type !== 'cache') {
+      if (data.type === 'cache') {
+        if (this.deepAnalysisActive) {
+          const { pv, info } = data
+          for (const line of pv) {
+            if (line) {
+              this.emit('info', line)
+            }
+          }
+          if (Object.keys(info).length > 0) {
+            this.emit('info', info)
+          }
+        }
+      } else {
         this.emit(`eval-${data.type}`, ...arrayify(data.payload))
       }
     })
@@ -56,7 +69,19 @@ export class Engine extends EventEmitter {
    */
   run (binary, cwd) {
     return new Promise(resolve => {
-      this.once('active', info => resolve(info))
+      let mainInfo = null
+      let evalActive = false
+      const maybeResolve = () => {
+        if (mainInfo && evalActive) {
+          resolve(mainInfo)
+        }
+      }
+      const isActiveMessage = data => data.type === 'active' || (data.type === 'cache' && data.events.find(event => event.type === 'active'))
+
+      this.once('active', info => {
+        mainInfo = info
+        maybeResolve()
+      })
 
       // run main engine
       this.mainWorker.postMessage({
@@ -70,9 +95,9 @@ export class Engine extends EventEmitter {
         type: 'run'
       })
 
-      // initialize eval engine options
+      // initialize eval engine options after its UCI init/ready cycle is complete
       const listener = ({ data }) => {
-        if (data.type === 'active' || (data.type === 'cache' && data.events.find(event => event.type === 'active'))) {
+        if (isActiveMessage(data)) {
           this.evalWorker.removeEventListener('message', listener)
           const options = {
             UCI_AnalyseMode: 'true',
@@ -84,6 +109,8 @@ export class Engine extends EventEmitter {
               type: 'cmd'
             })
           }
+          evalActive = true
+          maybeResolve()
         }
       }
       this.evalWorker.addEventListener('message', listener)
@@ -99,7 +126,7 @@ export class Engine extends EventEmitter {
       payload: command,
       type: 'cmd'
     })
-    if (command.toLowerCase().includes('uci_variant')) {
+    if (command.toLowerCase().includes('uci_variant') || command.toLowerCase().includes('evalfile') || command.toLowerCase() === 'stop') {
       this.evalWorker.postMessage({
         payload: command,
         type: 'cmd'
@@ -131,5 +158,56 @@ export class Engine extends EventEmitter {
       })
     })
   }
+
+  /**
+   * Run an engine-backed review search on the eval worker.
+   * @param {Object} request review request containing fen, move, and line
+   * @returns {Promise<Object>} structured engine evidence
+   */
+  reviewAnalysis (request) {
+    return new Promise(resolve => {
+      this.evalWorker.onmessage = ({ data }) => {
+        if (data.type === 'cache') {
+          for (const { type, payload } of data.events) {
+            if (type === 'reviewed') {
+              resolve(payload)
+              delete this.evalWorker.onmessage
+            }
+          }
+        }
+      }
+      this.evalWorker.postMessage({
+        payload: request,
+        type: 'review'
+      })
+    })
+  }
+
+  /**
+   * Run supervised deep analysis on the eval worker.
+   * @param {Object} request deep-analysis request
+   * @returns {Promise<Object>} structured deep analysis report
+   */
+  deepAnalysis (request) {
+    this.deepAnalysisActive = true
+    return new Promise(resolve => {
+      this.evalWorker.onmessage = ({ data }) => {
+        if (data.type === 'cache') {
+          for (const { type, payload } of data.events) {
+            if (type === 'deep-analysis') {
+              this.deepAnalysisActive = false
+              resolve(payload)
+              delete this.evalWorker.onmessage
+            }
+          }
+        }
+      }
+      this.evalWorker.postMessage({
+        payload: request,
+        type: 'deep-analysis'
+      })
+    })
+  }
+
 }
 export const engine = new Engine()

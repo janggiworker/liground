@@ -65,6 +65,16 @@ import PromotionModal from './PromotionModal.vue'
 const WHITE = true
 const BLACK = false
 
+const BOARD_INTERACTION_MODES = Object.freeze({
+  NORMAL_GAME: 'NORMAL_GAME',
+  ANALYSIS: 'ANALYSIS',
+  BOARD_EDITOR: 'BOARD_EDITOR',
+  REVIEW_SEQUENCE: 'REVIEW_SEQUENCE',
+  REVIEW_PREVIEW: 'REVIEW_PREVIEW'
+})
+
+const SAFE_SHAPE_BRUSHES = Object.freeze(['red', 'green', 'blue', 'yellow', 'paleBlue', 'paleGreen', 'paleRed'])
+
 export default {
   name: 'ChessGround',
   components: {
@@ -180,6 +190,7 @@ export default {
       promotionMove: undefined,
       pieceStyleEl: null,
       boardStyleEl: null,
+      boardSyncFrame: null,
       start: true
     }
   },
@@ -196,7 +207,67 @@ export default {
       return this.$store.getters.turn ? 'white' : 'black'
     },
     legalMoves () {
-      return this.$store.getters.legalMoves.split(' ')
+      return String(this.$store.getters.legalMoves || '').split(/\s+/).filter(Boolean)
+    },
+    boardInteractionMode () {
+      if (this.reviewPreviewActive) return BOARD_INTERACTION_MODES.REVIEW_PREVIEW
+      if (this.reviewSequenceActive) return BOARD_INTERACTION_MODES.REVIEW_SEQUENCE
+      if (this.editorMode) return BOARD_INTERACTION_MODES.BOARD_EDITOR
+      if (this.analysisMode) return BOARD_INTERACTION_MODES.ANALYSIS
+      return BOARD_INTERACTION_MODES.NORMAL_GAME
+    },
+    boardStateSource () {
+      const mode = this.boardInteractionMode
+      if (mode === BOARD_INTERACTION_MODES.REVIEW_PREVIEW) {
+        const preview = this.reviewPreview || {}
+        const move = preview.move || {}
+        return {
+          mode,
+          fen: preview.fen || (this.reviewSequenceActive ? this.reviewSequence.fen : this.fen),
+          turnColor: move.side === 'opponent' ? 'white' : 'black',
+          legalMoves: [],
+          mutableHistory: false,
+          movable: false,
+          free: false,
+          lastMove: move.move || null
+        }
+      }
+      if (mode === BOARD_INTERACTION_MODES.REVIEW_SEQUENCE) {
+        const sequence = this.reviewSequence || {}
+        return {
+          mode,
+          fen: sequence.fen || this.fen,
+          turnColor: sequence.turn ? 'white' : 'black',
+          legalMoves: String(sequence.legalMoves || '').split(/\s+/).filter(Boolean),
+          mutableHistory: false,
+          movable: true,
+          free: false,
+          lastMove: sequence.lastMove || null
+        }
+      }
+      if (mode === BOARD_INTERACTION_MODES.BOARD_EDITOR) {
+        return {
+          mode,
+          fen: this.fen,
+          turnColor: this.turn,
+          legalMoves: [],
+          mutableHistory: false,
+          movable: true,
+          free: true,
+          lastMove: this.currentMove && this.currentMove.uci
+        }
+      }
+      const canMoveOnShownFen = this.fen === this.lastFen || mode === BOARD_INTERACTION_MODES.ANALYSIS
+      return {
+        mode,
+        fen: this.fen,
+        turnColor: this.turn,
+        legalMoves: this.legalMoves,
+        mutableHistory: true,
+        movable: canMoveOnShownFen,
+        free: false,
+        lastMove: this.currentMove && this.currentMove.uci
+      }
     },
     promotionPosition () {
       if (this.promotionMove) {
@@ -215,6 +286,9 @@ export default {
       }
     },
     isPlayerTurn () {
+      if (this.boardInteractionMode === BOARD_INTERACTION_MODES.REVIEW_PREVIEW || this.boardInteractionMode === BOARD_INTERACTION_MODES.REVIEW_SEQUENCE || this.boardInteractionMode === BOARD_INTERACTION_MODES.BOARD_EDITOR || this.boardInteractionMode === BOARD_INTERACTION_MODES.ANALYSIS) {
+        return true
+      }
       // In PvE: allow moves only when it's the player's turn
       if (this.PvE) {
         const playerCanMove = (this.turn === 'white') === this.PvEPlayerIsWhite
@@ -231,7 +305,7 @@ export default {
       // Block mouse input completely when not player's turn
       return this.isPlayerTurn ? 'auto' : 'none'
     },
-    ...mapGetters(['initialized', 'variant', 'multipv', 'hoveredpv', 'redraw', 'pieceStyle', 'boardStyle', 'fen', 'lastFen', 'orientation', 'moves', 'isPast', 'dimensionNumber', 'analysisMode', 'active', 'PvE', 'PvEPlayerIsWhite', 'EvE', 'enginetime', 'resized', 'resized9x9width', 'resized9x9height', 'resized9x10width', 'resized9x10height', 'dimNumber'])
+    ...mapGetters(['initialized', 'variant', 'multipv', 'hoveredpv', 'redraw', 'pieceStyle', 'boardStyle', 'fen', 'lastFen', 'orientation', 'moves', 'isPast', 'dimensionNumber', 'analysisMode', 'editorMode', 'analysisVisualization', 'reviewSequence', 'reviewSequenceActive', 'reviewPreview', 'reviewPreviewActive', 'reviewOverlays', 'active', 'PvE', 'PvEPlayerIsWhite', 'EvE', 'enginetime', 'resized', 'resized9x9width', 'resized9x9height', 'resized9x10width', 'resized9x10height', 'dimNumber'])
   },
   watch: {
     dimensionNumber () {
@@ -267,12 +341,15 @@ export default {
     },
     initialized () {
       this.updateBoard()
+      this.renderAnalysisVisualization()
     },
     fen () {
       this.updateBoard()
+      this.renderAnalysisVisualization()
     },
     orientation () {
       this.updateBoard()
+      this.renderAnalysisVisualization()
       document.dispatchEvent(new Event('renderPromotion'))
     },
     pieceStyle (pieceStyle) {
@@ -282,71 +359,37 @@ export default {
     boardStyle (boardStyle) {
       this.updateBoardCSS(boardStyle)
     },
-    multipv () {
-      // Don't draw engine arrows during PvE or EvE modes
-      if (this.PvE || this.EvE) {
-        this.shapes = []
-        this.pieceShapes = []
-        this.drawShapes()
-        return
+    multipv () { this.renderAnalysisVisualization() },
+    analysisVisualization: {
+      deep: true,
+      handler () {
+        this.renderAnalysisVisualization()
       }
-
-      const multipv = this.multipv
-      const shapes = []
-      const pieceShapes = []
-      for (const [i, pvline] of multipv.entries()) {
-        if (pvline && 'ucimove' in pvline && pvline.ucimove.length > 0) {
-          const lineWidth = 2 + ((multipv.length - i) / multipv.length) * 8
-          const move = pvline.ucimove
-          let orig = move.substring(0, 2)
-          let dest = move.substring(2, 4)
-          let drawShape
-          if (this.dimensionNumber === 3) {
-            const extract = this.extractMoves(move)
-            orig = extract[0].replace('10', ':')
-            dest = extract[1].replace('10', ':')
-          }
-          if (move.includes('@')) {
-            const pieceType = move[0].toLowerCase()
-            const pieceConv = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' }
-            pieceShapes.unshift({
-              orig: dest,
-              dest: dest,
-              brush: 'paleBlue',
-              modifiers: { lineWidth },
-              piece: {
-                role: pieceConv[pieceType],
-                color: this.turn
-              }
-            })
-            drawShape = { orig: dest, brush: 'paleBlue', modifiers: { lineWidth } }
-          } else {
-            drawShape = { orig, dest, brush: 'paleBlue', modifiers: { lineWidth } }
-          }
-          // adjust color if pv line is hovered
-          if (i === this.hoveredpv) {
-            drawShape.brush = 'blue'
-          }
-          if (i === 0) {
-            drawShape.brush = 'yellow'
-          }
-          // put item in front of list, so that the best move is drawn last
-          shapes.unshift(drawShape)
-        }
-      }
-      this.pieceShapes = pieceShapes
-      this.shapes = shapes
-      this.drawShapes()
     },
-    hoveredpv () {
-      const index = this.shapes.length - this.hoveredpv - 1
-      for (const [i, shape] of this.shapes.entries()) {
-        shape.brush = i === index ? 'blue' : 'paleBlue'
-        if (i === this.shapes.length - 1) {
-          this.shapes[this.shapes.length - 1].brush = 'yellow'
-        }
+    hoveredpv () { this.renderAnalysisVisualization() },
+    reviewOverlays () {
+      this.scheduleBoardInteractionSync('reviewOverlays')
+    },
+    reviewSequence: {
+      deep: true,
+      handler () {
+        this.scheduleBoardInteractionSync('reviewSequence')
       }
-      this.drawShapes()
+    },
+    reviewPreview: {
+      deep: true,
+      handler () {
+        this.scheduleBoardInteractionSync('reviewPreview')
+      }
+    },
+    resized () { this.scheduleBoardInteractionSync('resized') },
+    resized9x9width () { this.scheduleBoardInteractionSync('resized9x9width') },
+    resized9x9height () { this.scheduleBoardInteractionSync('resized9x9height') },
+    resized9x10width () { this.scheduleBoardInteractionSync('resized9x10width') },
+    resized9x10height () { this.scheduleBoardInteractionSync('resized9x10height') },
+    editorMode () {
+      this.updateBoard()
+      this.renderAnalysisVisualization()
     },
     variant () {
       if (this.variant === 'shogi') {
@@ -395,6 +438,17 @@ export default {
       this.updateBoard()
       this.isPromotionModalVisible = false
     }
+  },
+  beforeDestroy () {
+    if (this.boardSyncFrame) {
+      const caf = window.cancelAnimationFrame || window.clearTimeout
+      caf(this.boardSyncFrame)
+      this.boardSyncFrame = null
+    }
+    window.removeEventListener('mouseup', this.stopDragging)
+    window.removeEventListener('mousemove', this.doResize)
+    window.removeEventListener('wheel', this.reRender)
+    window.removeEventListener('mouseup', this.reRender)
   },
   mounted () {
     if (!isNaN(Number(localStorage.resized))) {
@@ -462,8 +516,168 @@ export default {
       this.startingPoint = this.enlarged
     }
     document.body.dispatchEvent(new Event('chessground.resize'))
+    this.renderAnalysisVisualization()
   },
   methods: {
+    toBoardKeys (move) {
+      let orig = move.substring(0, 2)
+      let dest = move.substring(2, 4)
+      if (this.dimensionNumber === 3) {
+        const extract = this.extractMoves(move)
+        orig = extract[0].replace('10', ':')
+        dest = extract[1].replace('10', ':')
+      }
+      return { orig, dest }
+    },
+    isReviewDebugEnabled () {
+      return Boolean(typeof window !== 'undefined' && (window.__LIGROUND_REVIEW_DEBUG__ || (window.localStorage && window.localStorage.reviewDebug === '1')))
+    },
+    debugBoardInteraction (stage, extra = {}) {
+      if (!this.isReviewDebugEnabled()) return
+      const source = this.boardStateSource
+      const movable = this.board && this.board.state ? this.board.state.movable : null
+      const wrap = this.$refs.board && this.$refs.board.querySelector ? this.$refs.board.querySelector('.cg-wrap') : null
+      const bounds = wrap && wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null
+      console.debug('[review-sequence-board]', stage, {
+        mode: source.mode,
+        pointerEvents: this.boardPointerEvents,
+        fen: source.fen,
+        turnColor: source.turnColor,
+        legalMoveCount: source.legalMoves.length,
+        movableConfig: extra.movableConfig,
+        boardMovable: movable && {
+          color: movable.color,
+          free: movable.free,
+          destCount: movable.dests ? Object.keys(movable.dests).length : 0,
+          hasAfter: Boolean(movable.events && movable.events.after),
+          hasAfterNewPiece: Boolean(movable.events && movable.events.afterNewPiece)
+        },
+        bounds: bounds && { width: bounds.width, height: bounds.height, top: bounds.top, left: bounds.left },
+        reviewLineLength: this.reviewSequence && this.reviewSequence.line ? this.reviewSequence.line.length : 0,
+        ...extra
+      })
+    },
+    scheduleBoardInteractionSync (reason) {
+      if (!this.board) return
+      if (this.boardSyncFrame) {
+        const caf = window.cancelAnimationFrame || window.clearTimeout
+        caf(this.boardSyncFrame)
+      }
+      const raf = window.requestAnimationFrame || (callback => window.setTimeout(callback, 16))
+      this.boardSyncFrame = raf(() => {
+        this.boardSyncFrame = null
+        document.body.dispatchEvent(new Event('chessground.resize'))
+        this.updateBoard()
+        this.$nextTick(() => {
+          document.body.dispatchEvent(new Event('chessground.resize'))
+          this.drawShapes()
+          this.debugBoardInteraction(`synced:${reason}`)
+        })
+      })
+    },
+    stableShapeBrush (brush, fallback = 'blue') {
+      if (brush === 'orange') return 'yellow'
+      return SAFE_SHAPE_BRUSHES.includes(brush) ? brush : fallback
+    },
+    stableShapeModifiers (modifiers) {
+      if (!modifiers) return undefined
+      const lineWidth = Number(modifiers.lineWidth)
+      if (Number.isFinite(lineWidth) && lineWidth > 0) {
+        return { lineWidth: Math.max(2, Math.min(8, lineWidth)) }
+      }
+      return undefined
+    },
+    reviewOverlayToShape (overlay) {
+      if (!overlay) return null
+      const brush = this.stableShapeBrush(overlay.brush, overlay.kind === 'danger' ? 'red' : 'blue')
+      const modifiers = this.stableShapeModifiers(overlay.modifiers)
+      if ((overlay.kind === 'arrow' || !overlay.kind) && overlay.orig && overlay.dest) {
+        const orig = this.toBoardKeys(`${overlay.orig}${overlay.dest}`).orig
+        const dest = this.toBoardKeys(`${overlay.orig}${overlay.dest}`).dest
+        return { orig, dest, brush, label: overlay.label, modifiers }
+      }
+      const square = overlay.square || overlay.orig || overlay.dest
+      if (square) {
+        const key = this.toBoardKeys(`${square}${square}`).orig
+        return { orig: key, brush, label: overlay.label, modifiers }
+      }
+      return null
+    },
+    renderAnalysisVisualization () {
+      if (this.PvE || this.EvE) return
+      if (this.reviewSequenceActive) {
+        this.shapes = []
+        this.pieceShapes = []
+        this.drawShapes()
+        return
+      }
+      if (this.editorMode) {
+        // preserve analysis overlays while editing; don't recompute/clear them
+        this.drawShapes()
+        return
+      }
+      const cfg = this.analysisVisualization
+      const shapes = []
+      const pieceShapes = []
+      const trajectoryShapes = []
+      const multipvShapes = []
+      const visibleMultiPv = cfg.multiPvCount > 0 ? this.multipv.slice(0, cfg.multiPvCount) : this.multipv
+      const showTrajectoryArrows = cfg.visualizationMode === 'arrow' || cfg.visualizationMode === 'hybrid'
+      if (cfg.showMultiPvArrows) {
+        for (const [i, pvline] of visibleMultiPv.entries()) {
+          if (!pvline || !pvline.ucimove) continue
+          const { orig, dest } = this.toBoardKeys(pvline.ucimove)
+          const highlighted = i === 0 ? 'yellow' : (i === this.hoveredpv ? 'blue' : 'paleBlue')
+          multipvShapes.unshift({ orig, dest, brush: highlighted, modifiers: { lineWidth: 2 + ((visibleMultiPv.length - i) / Math.max(1, visibleMultiPv.length)) * 8 } })
+        }
+      }
+      if (cfg.trajectoryEnabled && this.multipv[0] && this.multipv[0].pvUCI) {
+        const trajectoryBrushes = ['red', 'yellow', 'green', 'blue', 'paleBlue']
+        const allMoves = this.multipv[0].pvUCI.split(/\s+/).filter(Boolean)
+        const maxMoves = cfg.trajectoryUnlimited ? allMoves.length : Math.min(allMoves.length, cfg.trajectoryDepth)
+        const tempPieces = { ...(this.board && this.board.state && this.board.state.pieces ? this.board.state.pieces : {}) }
+        for (let idx = 0; idx < maxMoves; idx++) {
+          if (cfg.trajectorySideMode === 'my' && idx % 2 === 1) continue
+          const move = allMoves[idx]
+          if (move.includes('@')) continue
+          const { orig, dest } = this.toBoardKeys(move)
+          const progress = idx / Math.max(1, maxMoves)
+          const lineWidth = cfg.orderThickness ? Math.max(1.5, 7 - progress * 5) : 3
+          const circled = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳']
+          const label = cfg.orderNumbers ? (idx < circled.length ? circled[idx] : String(idx + 1)) : undefined
+          const brush = trajectoryBrushes[idx % trajectoryBrushes.length]
+          if (showTrajectoryArrows) {
+            trajectoryShapes.push({ orig, dest, brush, label, modifiers: { lineWidth } })
+          }
+          if (cfg.visualizationMode === 'ghost' || cfg.visualizationMode === 'hybrid') {
+            const pieceOnOrig = tempPieces[orig]
+            const normalizedColor = pieceOnOrig && (pieceOnOrig.color === 'white' || pieceOnOrig.color === true ? 'white' : (pieceOnOrig.color === 'black' || pieceOnOrig.color === false ? 'black' : null))
+            if (!pieceOnOrig || !pieceOnOrig.role || !normalizedColor) {
+              if (this.isReviewDebugEnabled()) console.warn('[viz] invalid ghost piece', { idx, orig, dest, pieceOnOrig })
+            } else {
+              const ghostOpacity = idx === 0 ? 0.65 : (idx === 1 ? 0.45 : 0.25)
+              const ghostShape = {
+                orig: dest,
+                piece: { role: pieceOnOrig.role, color: normalizedColor },
+                brush: 'paleBlue',
+                modifiers: { opacity: ghostOpacity, lineWidth: 1.5 }
+              }
+              if (ghostShape.piece && ghostShape.piece.role && ghostShape.piece.color) {
+                pieceShapes.push(ghostShape)
+              }
+            }
+          }
+          if (tempPieces[orig]) {
+            tempPieces[dest] = tempPieces[orig]
+            delete tempPieces[orig]
+          }
+        }
+      }
+      this.shapes = [...multipvShapes, ...trajectoryShapes]
+      this.pieceShapes = pieceShapes
+      if (this.isReviewDebugEnabled()) console.debug('[viz] multipvShapes=', multipvShapes.length, 'trajectoryShapes=', trajectoryShapes.length, 'ghostShapes=', pieceShapes.length, 'cfg=', cfg, 'multipvRaw=', this.multipv)
+      this.drawShapes()
+    },
     closeCursorHand () {
       const board = document.querySelector('.cg-wrap')
       board.style.cursor = 'grabbing'
@@ -638,9 +852,15 @@ export default {
     closePromotionModal (value) {
       this.isPromotionModalVisible = false
       this.promotionMove = this.promotionMove + value
+      if (this.reviewSequenceActive) {
+        this.handleReviewSequenceMove(this.promotionMove, 'promotion')
+        return
+      }
       this.lastMoveSan = this.$store.getters.sanMove(this.promotionMove)
       const prevMov = this.currentMove
-      this.$store.dispatch('push', { move: this.promotionMove, prev: prevMov })
+      this.$store.dispatch('push', { move: this.promotionMove, prev: prevMov }).then(() => {
+        this.$store.dispatch('onHumanMoveComplete')
+      })
       this.updateHand()
       this.afterMove()
     },
@@ -661,7 +881,8 @@ export default {
       if (this.$store.getters.isInternational) {
         node.href = '../../../../static/board-css/international/' + boardStyle + '.css'
       } else if (this.$store.getters.isXiangqi || this.$store.getters.isJanggi) {
-        node.href = '../../../../static/board-css/xiangqi/' + this.variant + '/' + boardStyle + '.css'
+        const boardVariant = this.variant === 'janggimodern' ? 'janggi' : this.variant
+        node.href = '../../../../static/board-css/xiangqi/' + boardVariant + '/' + boardStyle + '.css'
       } else if (this.$store.getters.isSEA) {
         node.href = '../../../../static/board-css/sea/' + boardStyle + '.css'
       } else if (this.$store.getters.isShogi) {
@@ -706,23 +927,26 @@ export default {
       const ret = letters.join('')
       return ret
     },
-    possibleMoves () {
+    possibleMoves (moves = this.legalMoves) {
       const dests = {}
+      const legalMoves = Array.isArray(moves) ? moves : String(moves || '').split(/\s+/).filter(Boolean)
 
-      let fromSq
-      let toSq
-      for (let i = 0; i < this.legalMoves.length; i++) {
-        // don't include dropping moves
-        if (this.legalMoves[i].length !== 3) {
-          const Move = this.legalMoves[i]
-          fromSq = Move.substring(0, 2)
-          toSq = Move.substring(2, 4)
-          if (this.dimensionNumber === 3) {
-            const extract = this.extractMoves(Move)
-            fromSq = extract[0].replace('10', ':')
-            toSq = extract[1].replace('10', ':')
-          }
+      for (let i = 0; i < legalMoves.length; i++) {
+        const Move = legalMoves[i]
+        let fromSq
+        let toSq
+        // don't include drops, pass/null moves, or malformed moves in drag destinations
+        if (!Move || Move.includes('@') || Move === '0000' || Move.length < 4) {
+          continue
         }
+        fromSq = Move.substring(0, 2)
+        toSq = Move.substring(2, 4)
+        if (this.dimensionNumber === 3) {
+          const extract = this.extractMoves(Move)
+          fromSq = extract[0].replace('10', ':')
+          toSq = extract[1].replace('10', ':')
+        }
+        if (!fromSq || !toSq) continue
         if (fromSq in dests) {
           dests[fromSq].push(toSq)
         } else {
@@ -731,13 +955,13 @@ export default {
       }
       return dests
     },
-    isPromotion (uciMove) {
-      for (let i = 0; i < this.legalMoves.length; i++) {
+    isPromotion (uciMove, legalMoves = this.legalMoves) {
+      for (let i = 0; i < legalMoves.length; i++) {
         if (this.dimensionNumber === 3) {
           return false
         }
-        if (this.legalMoves[i].length === 5) {
-          if (this.legalMoves[i].includes(uciMove)) {
+        if (legalMoves[i].length === 5) {
+          if (legalMoves[i].includes(uciMove)) {
             return true
           }
         }
@@ -819,11 +1043,25 @@ export default {
     },
     afterDrag () {
       return (role, key) => {
+        const mode = this.boardInteractionMode
+        if (mode === BOARD_INTERACTION_MODES.REVIEW_SEQUENCE) {
+          const pieces = { 'p-piece': 'P', 'n-piece': 'N', 'b-piece': 'B', 'r-piece': 'R', 'q-piece': 'Q', 's-piece': 'S', 'g-piece': 'G', 'l-piece': 'L' }
+          const move = pieces[role] + '@' + key
+          this.handleReviewSequenceMove(move, 'drop')
+          return
+        }
+        if (mode === BOARD_INTERACTION_MODES.BOARD_EDITOR) {
+          this.$store.dispatch('fen', this.board.getFen())
+          this.$store.dispatch('lastFen', this.board.getFen())
+          return
+        }
         const pieces = { 'p-piece': 'P', 'n-piece': 'N', 'b-piece': 'B', 'r-piece': 'R', 'q-piece': 'Q', 's-piece': 'S', 'g-piece': 'G', 'l-piece': 'L' }
         const move = pieces[role] + '@' + key
         const prevMov = this.currentMove
         if (this.$store.getters.legalMoves.includes(move)) {
-          this.$store.dispatch('push', { move: move, prev: prevMov })
+          this.$store.dispatch('push', { move: move, prev: prevMov }).then(() => {
+            this.$store.dispatch('onHumanMoveComplete')
+          })
           this.updateHand()
         } else {
           this.updateBoard()
@@ -832,15 +1070,30 @@ export default {
     },
     changeTurn () {
       return (orig, dest, metadata) => {
+        const mode = this.boardInteractionMode
+        if (mode === BOARD_INTERACTION_MODES.BOARD_EDITOR) {
+          const editedFen = this.board.getFen()
+          this.$store.dispatch('fen', editedFen)
+          this.$store.dispatch('lastFen', editedFen)
+          this.board.state.lastMove = [orig, dest]
+          this.drawShapes()
+          return
+        }
         let uciMove = orig + dest
         if (this.dimensionNumber === 3) {
           uciMove = uciMove.replaceAll(':', '10') // Convert the ':' back to '10'
         }
-        if (this.isPromotion(uciMove)) {
+        if (mode === BOARD_INTERACTION_MODES.REVIEW_SEQUENCE) {
+          this.handleReviewSequenceMove(uciMove, 'move')
+          return
+        }
+        if (this.isPromotion(uciMove, this.boardStateSource.legalMoves)) {
           if (this.variant === 'makruk') {
             const move = uciMove + 'm'
             const prevMov = this.currentMove
-            this.$store.dispatch('push', { move: move, prev: prevMov })
+            this.$store.dispatch('push', { move: move, prev: prevMov }).then(() => {
+              this.$store.dispatch('onHumanMoveComplete')
+            })
           } else {
             this.setPromotionOptions(uciMove)
             this.promotionMove = uciMove
@@ -849,11 +1102,27 @@ export default {
         } else {
           this.lastMoveSan = this.$store.getters.sanMove(uciMove)
           const prevMov = this.currentMove
-          this.$store.dispatch('push', { move: uciMove, prev: prevMov })
+          this.$store.dispatch('push', { move: uciMove, prev: prevMov }).then(() => {
+            this.$store.dispatch('onHumanMoveComplete')
+          })
           this.updateHand()
           this.afterMove()
         }
       }
+    },
+
+    handleReviewSequenceMove (move, source) {
+      this.debugBoardInteraction(`review-${source}:before`, { move })
+      this.$store.dispatch('addReviewSequenceMove', move).then(accepted => {
+        if (!accepted) {
+          this.updateBoard()
+          this.drawShapes()
+        }
+        this.$nextTick(() => {
+          document.body.dispatchEvent(new Event('chessground.resize'))
+          this.debugBoardInteraction(`review-${source}:after`, { move, accepted })
+        })
+      })
     },
     updatePocket (pocket, pocketPieces, color) {
       for (let idx = 0; idx < pocketPieces.length; ++idx) {
@@ -901,17 +1170,20 @@ export default {
       this.$store.dispatch('lastFen', this.fen)
     },
     updateBoard () {
+      const source = this.boardStateSource
+      const reviewMode = source.mode === BOARD_INTERACTION_MODES.REVIEW_SEQUENCE || source.mode === BOARD_INTERACTION_MODES.REVIEW_PREVIEW
       // logic to find out if a check should be displayed:
       let isCheck = false // ensures that no check is displayed when the current move was not a check
-      if (this.currentMove !== undefined && (this.currentMove.name.includes('+') || this.currentMove.name.includes('#'))) { // the last move was check iff the san notation of the last move contained a '+'
+      if (!reviewMode && source.mode !== BOARD_INTERACTION_MODES.BOARD_EDITOR && this.currentMove !== undefined && (this.currentMove.name.includes('+') || this.currentMove.name.includes('#'))) { // the last move was check iff the san notation of the last move contained a '+'
         this.moves[this.moves.length - 1].check = this.turn // the check property of the board accepts a color or a boolean
         isCheck = this.currentMove.check
       }
       // logic to find out which move was last and should thus be highlighted:
-      if (this.currentMove === undefined || this.moves.length === 0) {
+      const lastMoveString = source.lastMove
+      if (!lastMoveString || (!reviewMode && this.moves.length === 0)) {
         this.board.state.lastMove = undefined
       } else {
-        const string = String(this.currentMove.uci)
+        const string = String(lastMoveString)
         let first = string.substring(0, 2)
         let second = string.substring(2, 4)
         if (this.dimensionNumber === 3) {
@@ -925,32 +1197,68 @@ export default {
           this.board.state.lastMove = [first, second]
         }
       }
+      const movableEvents = { after: this.changeTurn(), afterNewPiece: this.afterDrag() }
+      const movable = source.free
+        ? {
+            free: true,
+            color: 'both',
+            dests: undefined,
+            events: movableEvents
+          }
+        : source.movable
+        ? {
+            free: false,
+            dests: this.possibleMoves(source.legalMoves),
+            color: reviewMode ? 'both' : source.turnColor,
+            events: movableEvents,
+            rookCastle: true
+          }
+        : {
+            free: false,
+            dests: {},
+            color: source.turnColor,
+            events: movableEvents
+          }
+      this.debugBoardInteraction('updateBoard:before', { movableConfig: movable })
       this.board.set({
         check: isCheck,
-        fen: this.fen,
-        turnColor: this.turn,
+        fen: source.fen,
+        turnColor: source.turnColor,
         highlight: {
           lastMove: true,
           check: true
         },
-        movable: (this.fen === this.lastFen || this.analysisMode)
-          ? {
-              dests: this.possibleMoves(),
-              color: this.turn
-            }
-          : {
-              dests: {},
-              color: this.turn
-            },
+        movable,
+        drawable: {
+          enabled: !reviewMode,
+          visible: true,
+          eraseOnClick: false
+        },
         orientation: this.orientation
       })
-      if (this.variant === 'crazyhouse' || this.variant === 'shogi') {
+      this.debugBoardInteraction('updateBoard:after', { movableConfig: movable })
+      if (!reviewMode && (this.variant === 'crazyhouse' || this.variant === 'shogi')) {
         this.updateHand()
       }
     },
     drawShapes () {
       if (this.board !== null) {
-        this.board.setAutoShapes([...this.shapes, ...this.pieceShapes])
+        const reviewShapes = (this.reviewOverlays || []).map(this.reviewOverlayToShape).filter(Boolean)
+        const baseShapes = (this.reviewSequenceActive || this.reviewPreviewActive) ? [] : this.shapes
+        const basePieceShapes = (this.reviewSequenceActive || this.reviewPreviewActive) ? [] : this.pieceShapes
+        const combinedShapes = [...baseShapes, ...basePieceShapes, ...reviewShapes].map(shape => {
+          if (!shape) return null
+          return {
+            ...shape,
+            brush: this.stableShapeBrush(shape.brush, 'blue'),
+            modifiers: this.stableShapeModifiers(shape.modifiers)
+          }
+        }).filter(Boolean)
+        if (this.board.state.lastMove && this.board.state.lastMove.length === 2) {
+          combinedShapes.push({ orig: this.board.state.lastMove[0], dest: this.board.state.lastMove[1], brush: 'green' })
+        }
+        this.board.setAutoShapes(combinedShapes)
+        this.debugBoardInteraction('drawShapes', { shapeCount: combinedShapes.length, reviewShapeCount: reviewShapes.length })
       }
     },
     removeFocusFromInputs () {
@@ -1012,6 +1320,18 @@ export default {
 }
 .cg-board-wrap {
   position: relative;
+}
+.cg-wrap svg {
+  overflow: visible;
+  opacity: 0.88;
+  z-index: 6;
+  pointer-events: none;
+}
+.cg-wrap svg .brush-red,
+.cg-wrap svg .brush-yellow,
+.cg-wrap svg .brush-green,
+.cg-wrap svg .brush-blue {
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.65));
 }
 .koth cg-container::before {
   width: 25%;

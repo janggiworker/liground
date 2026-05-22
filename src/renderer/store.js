@@ -3,6 +3,8 @@ import Vuex from 'vuex'
 import ffish from 'ffish'
 import { engine, Engine } from './engine'
 import allEngines from './store/engines'
+import { createReviewRequest, emptyReviewState, emptyReviewSequenceState, REVIEW_MARKER_MODES, REVIEW_MODES } from '../shared/review/schema'
+import { analyzeReviewRequest } from '../shared/review/reviewService'
 
 import moveAudio from './assets/audio/Move.mp3'
 import captureAudio from './assets/audio/Capture.mp3'
@@ -108,6 +110,281 @@ function normalizeFen (fen) {
   return parts.join(' ')
 }
 
+function normalizedMoveLineFromHistory (moves) {
+  if (!Array.isArray(moves) || moves.length === 0) return ''
+  const line = []
+  let node = moves[moves.length - 1]
+  while (node) {
+    if (node.uci) line.push(node.uci)
+    node = node.prev
+  }
+  return line.reverse().join(' ')
+}
+
+function buildPositionCommand (gameState) {
+  const safeFen = typeof gameState.fen === 'string' ? gameState.fen.trim() : ''
+  const safeStartFen = typeof gameState.startFen === 'string' ? gameState.startFen.trim() : ''
+  const moves = Array.isArray(gameState.moves) ? gameState.moves : []
+  const variant = gameState.variant || 'chess'
+  const is960 = !!gameState.is960
+  const moveLine = normalizedMoveLineFromHistory(moves)
+  if (!safeStartFen) {
+    throw new Error('Invalid GameState: missing startFen. Refusing to fallback to startpos.')
+  }
+  // Reconstruct authoritative position from startFen + move history.
+  let reconstructedFen = safeStartFen
+  if (moveLine) {
+    try {
+      const board = is960 ? new ffish.Board(variant, safeStartFen, true) : new ffish.Board(variant, safeStartFen)
+      for (const mv of moveLine.split(/\s+/).filter(Boolean)) {
+        board.push(mv)
+      }
+      reconstructedFen = board.fen()
+    } catch (err) {
+      throw new Error(`Failed to reconstruct position from GameState: ${err.message}`)
+    }
+  }
+  if (safeFen && normalizeFen(safeFen) !== normalizeFen(reconstructedFen)) {
+    throw new Error(`[GameState] fen mismatch detected: live=${safeFen} reconstructed=${reconstructedFen}`)
+  }
+  return `position fen ${reconstructedFen}`
+}
+
+function reviewMoveToOverlaySquares (move) {
+  if (typeof move !== 'string') return null
+  if (move.includes('@')) {
+    const dest = move.split('@')[1]
+    return dest ? { square: dest } : null
+  }
+  const match = move.match(/^([a-i]\d{1,2})([a-i]\d{1,2})/)
+  if (!match) return null
+  return { orig: match[1], dest: match[2] }
+}
+
+function normalizeReviewLegalMoves (legalMoves) {
+  if (Array.isArray(legalMoves)) return legalMoves.filter(Boolean)
+  return String(legalMoves || '').split(/\s+/).filter(Boolean)
+}
+
+function resolveReviewSequenceMove (legalMoves, move) {
+  if (!move) return null
+  const candidates = normalizeReviewLegalMoves(legalMoves)
+  if (candidates.includes(move)) return move
+  if (move.includes('@')) return null
+  const promotionMatches = candidates.filter(candidate => candidate && candidate.startsWith(move) && candidate.length > move.length)
+  if (promotionMatches.length === 0) return null
+  return promotionMatches.find(candidate => candidate.endsWith('q')) || promotionMatches[0]
+}
+
+
+function reviewLinePrefixLength (previousLine, nextLine) {
+  if (!Array.isArray(previousLine) || !Array.isArray(nextLine)) return 0
+  let idx = 0
+  while (idx < previousLine.length && idx < nextLine.length && previousLine[idx] === nextLine[idx]) idx++
+  return idx
+}
+
+function shouldDisplayReviewMoveForMarkerMode (ply, markerMode) {
+  if (markerMode === REVIEW_MARKER_MODES.FIRST_MOVE_ONLY) return ply === 1
+  if (markerMode === REVIEW_MARKER_MODES.OPPONENT_MOVES_ONLY) return ply % 2 === 0
+  if (markerMode === REVIEW_MARKER_MODES.BOTH_SIDES) return true
+  return ply % 2 === 1
+}
+
+function mergedReviewClassification (moves) {
+  const order = ['blunder', 'mistake', 'inaccuracy', 'needs_care', 'interesting_risk', 'attacking_try', 'complexity', 'practical', 'natural', 'good', 'excellent']
+  const sorted = moves.slice().sort((a, b) => {
+    const left = order.includes(a.classification) ? order.indexOf(a.classification) : order.length
+    const right = order.includes(b.classification) ? order.indexOf(b.classification) : order.length
+    return left - right
+  })
+  return sorted[0] || null
+}
+
+function mergeIncrementalReviewResult ({ previous, suffix, fullLine, fullSans, markerMode, prefixLength, requestContext }) {
+  const priorMoves = Array.isArray(previous.moves) ? previous.moves.slice(0, prefixLength) : []
+  const suffixMoves = Array.isArray(suffix.moves)
+    ? suffix.moves.map(move => {
+      const ply = prefixLength + move.ply
+      return {
+        ...move,
+        ply,
+        side: ply % 2 === 1 ? 'user' : 'opponent',
+        sideLabel: ply % 2 === 1 ? '내 수' : '상대 수',
+        previewLine: fullLine.slice(0, ply)
+      }
+    })
+    : []
+  const moves = priorMoves.concat(suffixMoves)
+  const markerMoves = moves.filter(move => shouldDisplayReviewMoveForMarkerMode(move.ply, markerMode))
+  const summaryMove = mergedReviewClassification(markerMoves.length ? markerMoves : moves)
+  const recentCount = suffixMoves.length
+  return {
+    ...suffix,
+    fen: previous.fen,
+    reviewedMove: fullLine[0] || suffix.reviewedMove,
+    reviewedLine: fullLine,
+    moveSan: Array.isArray(fullSans) ? fullSans[0] : suffix.moveSan,
+    markerMode,
+    markerModeLabel: suffix.markerModeLabel || previous.markerModeLabel,
+    moves,
+    markerMoves,
+    classification: summaryMove ? summaryMove.classification : suffix.classification,
+    classificationLabel: summaryMove ? summaryMove.classificationLabel : suffix.classificationLabel,
+    summary: `현재 기보 ${fullLine.length}수까지의 흐름입니다. 이전 ${prefixLength}수 분석은 유지하고, 최근 ${recentCount}수를 추가 엔진 확인해 전략 해설에 연결했습니다. ${summaryMove ? `${summaryMove.ply}수 ${summaryMove.sideLabel} ${summaryMove.move}가 현재 가장 중요한 확인 지점입니다.` : ''}`,
+    requestContext: {
+      ...(previous.requestContext || {}),
+      ...(requestContext || {}),
+      incremental: true,
+      prefixLength,
+      source: requestContext && requestContext.source ? requestContext.source : 'realtime-played-line'
+    },
+    engineEvidence: {
+      ...(suffix.engineEvidence || {}),
+      incremental: true,
+      prefixLength,
+      perMoveCount: moves.length
+    },
+    overlays: markerMoves.slice(-6).flatMap(move => Array.isArray(move.overlays) ? move.overlays : []),
+    risks: markerMoves.flatMap(move => Array.isArray(move.risks) ? move.risks : []).slice(-4),
+    keyMoments: (Array.isArray(previous.keyMoments) ? previous.keyMoments : []).concat((Array.isArray(suffix.keyMoments) ? suffix.keyMoments : []).map(moment => ({ ...moment, ply: prefixLength + moment.ply }))).slice(-8),
+    generatedAt: Date.now()
+  }
+}
+
+
+function suffixOnlyReviewResultFromFull ({ result, prefixLength }) {
+  if (!result || !prefixLength) return result
+  const adjustMove = move => {
+    const ply = move.ply - prefixLength
+    return {
+      ...move,
+      ply,
+      previewLine: Array.isArray(move.previewLine) ? move.previewLine.slice(prefixLength) : move.previewLine
+    }
+  }
+  const adjustMoment = moment => ({ ...moment, ply: moment.ply - prefixLength })
+  return {
+    ...result,
+    moves: Array.isArray(result.moves) ? result.moves.filter(move => move && move.ply > prefixLength).map(adjustMove) : [],
+    markerMoves: Array.isArray(result.markerMoves) ? result.markerMoves.filter(move => move && move.ply > prefixLength).map(adjustMove) : [],
+    keyMoments: Array.isArray(result.keyMoments) ? result.keyMoments.filter(moment => moment && moment.ply > prefixLength).map(adjustMoment) : []
+  }
+}
+
+
+function enrichReviewMovePreviewFens (result, variant, is960) {
+  if (!result || !Array.isArray(result.moves) || !result.fen) return result
+  let board
+  try {
+    board = is960 ? new ffish.Board(variant, result.fen, true) : new ffish.Board(variant, result.fen)
+  } catch (err) {
+    return result
+  }
+  const previewByPly = {}
+  for (const move of result.moves) {
+    if (!move || !move.move) continue
+    try {
+      board.push(move.move)
+      previewByPly[move.ply] = board.fen()
+    } catch (err) {
+      break
+    }
+  }
+  const enrich = move => move && previewByPly[move.ply] ? { ...move, previewFen: previewByPly[move.ply] } : move
+  return {
+    ...result,
+    moves: result.moves.map(enrich),
+    markerMoves: Array.isArray(result.markerMoves) ? result.markerMoves.map(enrich) : result.markerMoves
+  }
+}
+
+
+// Realtime commentary owns only the latest played move on the live board.
+// Rich review markers remain available in review panels and hover previews.
+function primaryRealtimeBoardOverlays (result, overlays, arrowsEnabled, currentFen) {
+  if (!result || arrowsEnabled === false) return []
+  const resultContext = result.requestContext || {}
+  if (resultContext.currentFen && currentFen && resultContext.currentFen !== currentFen) return []
+  const reviewedLine = Array.isArray(result.reviewedLine) ? result.reviewedLine : []
+  const latestPly = reviewedLine.length
+  if (!latestPly) return []
+  return (Array.isArray(overlays) ? overlays : [])
+    .filter(overlay => overlay && overlay.id === `move-marker-${latestPly}` && overlay.kind === 'arrow')
+    .slice(0, 1)
+    .map(overlay => ({ ...overlay, source: 'realtime-current-move' }))
+}
+
+function previewOverlaysForMove (move) {
+  if (!move) return []
+  const overlays = Array.isArray(move.overlays) ? move.overlays.slice(0, 6).map(overlay => ({ ...overlay, source: 'review-preview' })) : []
+  const sq = reviewMoveToOverlaySquares(move.move)
+  if (sq && sq.orig && sq.dest) {
+    overlays.push({
+      id: `hover-preview-move-${move.ply}`,
+      kind: 'arrow',
+      orig: sq.orig,
+      dest: sq.dest,
+      brush: move.tone === 'critical' ? 'red' : (move.tone === 'practical' ? 'yellow' : 'green'),
+      label: move.classificationLabel,
+      modifiers: { lineWidth: move.tone === 'critical' ? 7 : 5 },
+      source: 'review-preview'
+    })
+    overlays.push({
+      id: `hover-preview-target-${move.ply}`,
+      kind: 'highlight',
+      square: sq.dest,
+      brush: move.tone === 'critical' ? 'red' : (move.tone === 'practical' ? 'yellow' : 'green'),
+      label: '착점',
+      modifiers: { lineWidth: 4 },
+      source: 'review-preview'
+    })
+  }
+  const responseMove = move.punishmentMove || (typeof move.bestPv === 'string' ? move.bestPv.split(/\s+/).filter(Boolean)[0] : '')
+  const response = responseMove && responseMove !== move.move ? reviewMoveToOverlaySquares(responseMove) : null
+  if (response && response.orig && response.dest) {
+    overlays.push({
+      id: `hover-preview-response-${move.ply}`,
+      kind: 'arrow',
+      orig: response.orig,
+      dest: response.dest,
+      brush: move.tone === 'critical' || move.severity === 'blunder' || move.severity === 'mistake' ? 'red' : 'yellow',
+      label: move.punishmentMove ? '응징' : '응수',
+      modifiers: { lineWidth: move.tone === 'critical' ? 8 : 6 },
+      source: 'review-preview'
+    })
+    overlays.push({
+      id: `hover-preview-response-target-${move.ply}`,
+      kind: 'danger',
+      square: response.dest,
+      brush: move.tone === 'critical' ? 'red' : 'yellow',
+      label: '압박',
+      modifiers: { lineWidth: 4 },
+      source: 'review-preview'
+    })
+  }
+  return overlays
+}
+
+function buildReviewSequenceOverlays (line) {
+  const circled = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫']
+  return (Array.isArray(line) ? line : []).map((move, idx) => {
+    const sq = reviewMoveToOverlaySquares(move)
+    if (!sq) return null
+    const base = {
+      id: `review-sequence-${idx}`,
+      kind: sq.orig && sq.dest ? 'arrow' : 'highlight',
+      brush: idx % 2 === 0 ? 'yellow' : 'blue',
+      label: circled[idx] || String(idx + 1),
+      modifiers: { lineWidth: Math.max(2, 6 - idx * 0.4), opacity: Math.max(0.35, 0.85 - idx * 0.04) },
+      explanationId: 'sequence-path',
+      priority: 20,
+      source: 'review-sequence'
+    }
+    return sq.orig && sq.dest ? { ...base, orig: sq.orig, dest: sq.dest } : { ...base, square: sq.square }
+  }).filter(Boolean)
+}
+
 /**
  * Check if an option value is valid and emit warnings if necessary.
  * @param {any[]} options Array of engine options
@@ -210,6 +487,9 @@ function limiterToGo (limiter) {
     default: return `go movetime ${parseInt(limiter.value, 10) || 1000}`
   }
 }
+function sanitizeEngineMove (move) {
+  return String(move || '').trim().split(/\s+/)[0] || ''
+}
 
 export const store = new Vuex.Store({
   state: {
@@ -224,6 +504,16 @@ export const store = new Vuex.Store({
     PvEInput: 1000,
     PvELimiter: null, // stores the limiter config for the PvE engine
     PvEEngineInstance: null,
+    playVsEngineEnabled: false,
+    playVsEngineHumanSide: 'white',
+    engineTimeControlsEnabled: false,
+    engineTimeControlMode: 'depth', // depth | movesInTime | increment | perMove
+    engineTimeControlConfig: {
+      movesInTime: { moves: 40, minutes: 5 },
+      increment: { baseMinutes: 5, incrementSeconds: 3 },
+      perMove: { seconds: 3 }
+    },
+    engineSideClockMs: null,
     resized: 0,
     resized9x9height: 0,
     resized9x9width: 0,
@@ -235,6 +525,19 @@ export const store = new Vuex.Store({
     normalizedFen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -',
     lastFen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1', // to track the end of the current line
     startFen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+    gameState: {
+      startFen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+      moves: [],
+      sideToMove: 'white',
+      variant: 'chess',
+      clocks: {
+        whiteTimeMs: null,
+        blackTimeMs: null,
+        whiteIncrementMs: 0,
+        blackIncrementMs: 0
+      },
+      engineSettings: {}
+    },
     moves: [],
     firstMoves: [],
     mainFirstMove: null,
@@ -275,6 +578,7 @@ export const store = new Vuex.Store({
       Makruk: 'makruk',
       Shogi: 'shogi',
       Janggi: 'janggi',
+      'Janggi Modern': 'janggimodern',
       Xiangqi: 'xiangqi',
       Fischerandom: 'fischerandom'
 
@@ -293,11 +597,21 @@ export const store = new Vuex.Store({
       options: []
     },
     engineSettings: {},
+    nnueStatus: null,
     listOfEngineStats: [],
     engineStats: {
       depth: 0,
       isEvalCached: false,
       cachedDepth: -1,
+      seldepth: 0,
+      nodes: 0,
+      nps: 0,
+      hashfull: 0,
+      tbhits: 0,
+      time: 0
+    },
+    lastEngineStats: {
+      depth: 0,
       seldepth: 0,
       nodes: 0,
       nps: 0,
@@ -316,12 +630,14 @@ export const store = new Vuex.Store({
         ucimove: ''
       }
     ],
+    lastAnalysisResult: { cp: 0, mate: null, pv: '', ucimove: '', turn: true },
     numberOfEngines: [
       {
         number: 1
       }
     ],
     engineCounter: 1,
+    singleMoveRequestSeq: 0,
     hoveredpv: -1,
     counter: 0,
     pieceStyle: 'cburnett',
@@ -334,6 +650,47 @@ export const store = new Vuex.Store({
     curVar960Fen: '',
     viewAnalysis: true,
     analysisMode: true,
+    editorMode: false,
+    review: emptyReviewState(),
+    analysisVisualization: {
+      showMultiPvArrows: true,
+      multiPvCount: 3,
+      trajectoryEnabled: false,
+      trajectorySideMode: 'both',
+      trajectoryDepth: 12,
+      trajectoryUnlimited: false,
+      orderNumbers: true,
+      orderThickness: true,
+      orderOpacity: true,
+      analysisTargetDepth: 'infinite',
+      visualizationMode: 'arrow',
+      analysisModeType: 'normal',
+      deepCandidateCount: 3,
+      deepRootTimeMs: 15000,
+      deepTimePerCandidateMs: 30000,
+      deepSecondaryTimeMs: 180000,
+      deepDepthPerCandidate: 0,
+      deepClearHashBetweenCandidates: false,
+      deepInstabilitySensitivityCp: 80,
+      deepScheduleMode: 'equal',
+      deepMaxDurationMs: 300000,
+      deepDiversityThreshold: 2,
+      reviewDepthPreset: 'normal',
+      reviewDepth: 10,
+      reviewTacticalDepth: 8,
+      reviewStrategicHorizon: 20,
+      reviewPunishmentLineLength: 6,
+      reviewDetailLevel: 'balanced',
+      realtimeGameCommentary: false,
+      realtimeCommentaryArrows: false
+    },
+    deepAnalysis: {
+      running: false,
+      error: null,
+      report: null,
+      startedAt: null,
+      completedAt: null
+    },
     menuAtMove: null,
     displayMenu: true,
     darkMode: false,
@@ -349,7 +706,7 @@ export const store = new Vuex.Store({
       '+ Add Custom', 'xiangqi'
     ],
     janggiVariants: [
-      '+ Add Custom', 'janggi'
+      '+ Add Custom', 'janggi', 'janggimodern'
     ],
     shogiVariants: [
       '+ Add Custom', 'shogi'
@@ -370,6 +727,9 @@ export const store = new Vuex.Store({
     fen (state, payload) {
       state.fen = payload
       state.normalizedFen = normalizeFen(payload)
+      if (state.review && state.review.currentResult && state.review.currentResult.fen !== payload) {
+        state.review.overlays = []
+      }
     },
     engineIndex (state, payload) {
       state.engineIndex = payload
@@ -379,12 +739,45 @@ export const store = new Vuex.Store({
     },
     startFen (state, payload) {
       state.startFen = payload
+      state.gameState.startFen = payload
     },
     lastFen (state, payload) {
       state.lastFen = payload
     },
     turn (state, payload) {
       state.turn = payload
+      state.gameState.sideToMove = payload ? 'white' : 'black'
+    },
+    syncGameStateFromStore (state) {
+      const current = state.moves.find(m => m.fen === state.fen)
+      const line = []
+      let node = current
+      while (node) {
+        line.push(node)
+        node = node.prev
+      }
+      state.gameState.moves = line.reverse()
+      state.gameState.startFen = state.startFen
+      state.gameState.sideToMove = state.turn ? 'white' : 'black'
+      state.gameState.variant = state.variant
+      state.gameState.engineSettings = { ...(state.engineSettings || {}) }
+    },
+    commitEditorPositionAsStart (state) {
+      const committedFen = state.board.fen()
+      state.moves = []
+      state.firstMoves = []
+      state.mainFirstMove = null
+      state.startFen = committedFen
+      state.fen = committedFen
+      state.lastFen = committedFen
+      state.turn = state.board.turn()
+      state.legalMoves = state.board.legalMoves()
+      state.normalizedFen = normalizeFen(committedFen)
+      state.fenply = 1
+      state.gameState.startFen = committedFen
+      state.gameState.moves = []
+      state.gameState.sideToMove = state.turn ? 'white' : 'black'
+      state.gameState.variant = state.variant
     },
     mainFirstMove (state, payload) {
       state.mainFirstMove = payload
@@ -418,6 +811,27 @@ export const store = new Vuex.Store({
     },
     PvEEngineInstance (state, payload) {
       state.PvEEngineInstance = payload
+    },
+    playVsEngineEnabled (state, payload) {
+      state.playVsEngineEnabled = !!payload
+    },
+    playVsEngineHumanSide (state, payload) {
+      state.playVsEngineHumanSide = payload === 'black' ? 'black' : 'white'
+    },
+    engineTimeControlsEnabled (state, payload) {
+      state.engineTimeControlsEnabled = !!payload
+    },
+    engineTimeControlMode (state, payload) {
+      state.engineTimeControlMode = payload || 'depth'
+    },
+    engineTimeControlConfig (state, payload) {
+      state.engineTimeControlConfig = {
+        ...state.engineTimeControlConfig,
+        ...(payload || {})
+      }
+    },
+    engineSideClockMs (state, payload) {
+      state.engineSideClockMs = Number.isFinite(Number(payload)) ? Number(payload) : null
     },
     PvEParam (state, payload) {
       state.PvEParam = payload
@@ -494,6 +908,7 @@ export const store = new Vuex.Store({
         state.orientation = 'white'
       }
       state.variant = payload
+      state.gameState.variant = payload
     },
     selectedEngines (state, payload) {
       state.selectedEngines = payload
@@ -503,6 +918,7 @@ export const store = new Vuex.Store({
     },
     engineInfo (state, payload) {
       state.engineInfo = payload
+      state.nnueStatus = null
       const settings = {}
       for (const option of payload.options) {
         if (!filteredSettings.includes(option.name)) {
@@ -524,6 +940,12 @@ export const store = new Vuex.Store({
     },
     engineStats (state, payload) {
       state.engineStats = payload
+      if (payload && (payload.depth > 0 || payload.nodes > 0 || payload.time > 0)) {
+        state.lastEngineStats = { ...state.lastEngineStats, ...payload }
+      }
+    },
+    nnueStatus (state, payload) {
+      state.nnueStatus = payload
     },
     resetEngineStats (state) {
       state.enginetime = 0
@@ -544,10 +966,13 @@ export const store = new Vuex.Store({
       state.lastWdlDraw = null
       state.lastWdlLoss = null
     },
+    lastAnalysisResult (state, payload) {
+      state.lastAnalysisResult = { ...state.lastAnalysisResult, ...(payload || {}) }
+    },
     multipv (state, payload) {
       for (const pvline of payload) {
         if (pvline) {
-          pvline.cpDisplay = typeof pvline.mate === 'number' ? `#${calcForSide(pvline.mate, state.turn)}` : cpToString(calcForSide(pvline.cp, state.turn))
+          pvline.cpDisplay = typeof pvline.mate === 'number' ? `#${pvline.mate}` : cpToString(pvline.cp)
         }
       }
       state.multipv = payload
@@ -557,6 +982,9 @@ export const store = new Vuex.Store({
     },
     increment (state, payload) {
       state.counter += payload
+    },
+    nextSingleMoveRequestSeq (state) {
+      state.singleMoveRequestSeq += 1
     },
     resetMultiPV (state) {
       state.multipv = [
@@ -600,8 +1028,11 @@ export const store = new Vuex.Store({
       state.startFen = state.board.fen()
       state.selectedGame = null
       state.fenply = 1
+      state.lastAnalysisResult = { cp: 0, mate: null, pv: '', ucimove: '', turn: true }
+      state.lastEngineStats = { depth: 0, seldepth: 0, nodes: 0, nps: 0, hashfull: 0, tbhits: 0, time: 0 }
       this.commit('resetEngineStats')
       state.normalizedFen = normalizeFen(state.fen)
+      this.commit('syncGameStateFromStore')
     },
     resetBoard (state, payload) {
       if (!payload.is960) {
@@ -610,6 +1041,9 @@ export const store = new Vuex.Store({
       this.commit('newBoard', payload)
       state.selectedGame = null
       state.moves = []
+      state.lastAnalysisResult = { cp: 0, mate: null, pv: '', ucimove: '', turn: true }
+      state.lastEngineStats = { depth: 0, seldepth: 0, nodes: 0, nps: 0, hashfull: 0, tbhits: 0, time: 0 }
+      this.commit('syncGameStateFromStore')
     },
     appendMoves (state, payload) {
       const mov = payload.move.split(' ')
@@ -686,6 +1120,162 @@ export const store = new Vuex.Store({
     analysisMode (state, payload) {
       state.analysisMode = payload
     },
+    editorMode (state, payload) {
+      state.editorMode = payload
+    },
+    analysisVisualization (state, payload) {
+      state.analysisVisualization = { ...state.analysisVisualization, ...payload }
+    },
+    deepAnalysisStart (state) {
+      state.deepAnalysis = {
+        running: true,
+        error: null,
+        report: null,
+        startedAt: Date.now(),
+        completedAt: null
+      }
+    },
+    deepAnalysisResult (state, payload) {
+      state.deepAnalysis = {
+        running: false,
+        error: payload && payload.error ? payload.error : null,
+        report: payload && !payload.error ? payload : null,
+        startedAt: state.deepAnalysis.startedAt,
+        completedAt: Date.now()
+      }
+    },
+    deepAnalysisClear (state) {
+      state.deepAnalysis = {
+        running: false,
+        error: null,
+        report: null,
+        startedAt: null,
+        completedAt: null
+      }
+    },
+    reviewMarkerMode (state, payload) {
+      const mode = Object.values(REVIEW_MARKER_MODES).includes(payload) ? payload : REVIEW_MARKER_MODES.MY_MOVES_ONLY
+      state.review.markerMode = mode
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+      if (typeof localStorage !== 'undefined') {
+        localStorage.reviewMarkerMode = mode
+      }
+    },
+    reviewSetRequest (state, payload) {
+      state.review.lastRequestId = payload
+      state.review.loading = true
+      state.review.error = null
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+      state.review.active = true
+    },
+    reviewPrepareFullRebuild (state) {
+      const previousInteraction = state.review.sequence && state.review.sequence.previousInteraction
+      state.review.currentResult = null
+      state.review.overlays = []
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+      state.review.sequence = emptyReviewSequenceState()
+      state.review.resultsById = {}
+      state.review.error = null
+      state.review.lastRequestId = null
+      state.review.active = true
+      if (previousInteraction && typeof previousInteraction.analysisMode === 'boolean') {
+        state.analysisMode = previousInteraction.analysisMode
+      }
+      if (previousInteraction && typeof previousInteraction.editorMode === 'boolean') {
+        state.editorMode = previousInteraction.editorMode
+      }
+    },
+    reviewSetResult (state, payload) {
+      const result = enrichReviewMovePreviewFens(payload, state.variant, state.board && state.board.is960 && state.board.is960())
+      state.review.loading = false
+      state.review.error = null
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+      state.review.currentResult = result
+      state.review.overlays = Array.isArray(result.overlays) ? result.overlays : []
+      state.review.active = true
+      Vue.set(state.review.resultsById, result.id, result)
+    },
+    reviewPreviewSet (state, payload) {
+      state.review.preview = {
+        active: Boolean(payload && payload.previewFen),
+        fen: payload && payload.previewFen ? payload.previewFen : '',
+        move: payload || null,
+        overlays: previewOverlaysForMove(payload)
+      }
+    },
+    reviewPreviewClear (state) {
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+    },
+    reviewSetError (state, payload) {
+      state.review.loading = false
+      state.review.error = payload
+      state.review.active = true
+    },
+    reviewClear (state) {
+      const previousInteraction = state.review.sequence && state.review.sequence.previousInteraction
+      const markerMode = state.review.markerMode
+      state.review = emptyReviewState()
+      state.review.markerMode = markerMode
+      if (previousInteraction && typeof previousInteraction.analysisMode === 'boolean') {
+        state.analysisMode = previousInteraction.analysisMode
+      }
+      if (previousInteraction && typeof previousInteraction.editorMode === 'boolean') {
+        state.editorMode = previousInteraction.editorMode
+      }
+    },
+    reviewSequenceStart (state, payload) {
+      state.review.sequence = {
+        ...emptyReviewSequenceState(),
+        active: true,
+        baseFen: payload.fen,
+        fen: payload.fen,
+        turn: payload.turn,
+        legalMoves: payload.legalMoves,
+        previousInteraction: payload.previousInteraction || emptyReviewSequenceState().previousInteraction
+      }
+      state.review.currentResult = null
+      state.review.overlays = []
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+      state.review.error = null
+      state.review.active = true
+    },
+    reviewSequenceUpdate (state, payload) {
+      state.review.sequence = {
+        ...state.review.sequence,
+        fen: payload.fen,
+        turn: payload.turn,
+        legalMoves: payload.legalMoves,
+        line: payload.line,
+        sans: payload.sans,
+        overlays: buildReviewSequenceOverlays(payload.line),
+        lastMove: payload.lastMove,
+        previousInteraction: payload.previousInteraction || state.review.sequence.previousInteraction
+      }
+      state.review.currentResult = null
+      state.review.overlays = []
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+    },
+    reviewSequenceEnd (state) {
+      const previousInteraction = state.review.sequence.previousInteraction
+      state.review.sequence = emptyReviewSequenceState()
+      state.review.preview = { active: false, fen: '', move: null, overlays: [] }
+      if (previousInteraction && typeof previousInteraction.analysisMode === 'boolean') {
+        state.analysisMode = previousInteraction.analysisMode
+      }
+      if (previousInteraction && typeof previousInteraction.editorMode === 'boolean') {
+        state.editorMode = previousInteraction.editorMode
+      }
+    },
+    reviewSequenceClear (state) {
+      state.review.sequence = {
+        ...state.review.sequence,
+        fen: state.review.sequence.baseFen,
+        line: [],
+        sans: [],
+        overlays: [],
+        lastMove: null
+      }
+    },
     openedPGN (state, payload) {
       state.openedPGN = payload
     },
@@ -712,6 +1302,7 @@ export const store = new Vuex.Store({
       state.moves = payload
     },
     setEngineClock (state) {
+      clearInterval(state.clock)
       state.clock = setInterval(function () { state.enginetime = state.enginetime + 1000 }, 1000)
     },
     resetEngineTime (state) {
@@ -802,6 +1393,7 @@ export const store = new Vuex.Store({
         selectedGame: null,
         allEngines: allEngines,
         activeEngine: null,
+        review: emptyReviewState(),
         active: false
       }
 
@@ -853,6 +1445,9 @@ export const store = new Vuex.Store({
       if (localStorage.variant) {
         context.commit('variant', localStorage.variant)
       }
+      if (localStorage.reviewMarkerMode && Object.values(REVIEW_MARKER_MODES).includes(localStorage.reviewMarkerMode)) {
+        context.commit('reviewMarkerMode', localStorage.reviewMarkerMode)
+      }
       if (localStorage.engines) {
         try {
           context.state.allEngines = JSON.parse(localStorage.engines)
@@ -870,6 +1465,7 @@ export const store = new Vuex.Store({
       board.setFen(context.state.fen)
       context.commit('turn', board.turn())
       context.commit('legalMoves', board.legalMoves())
+      context.commit('syncGameStateFromStore')
     },
     push (context, payload) {
       context.commit('appendMoves', payload)
@@ -947,6 +1543,35 @@ export const store = new Vuex.Store({
     setPvEInput (context, payload) {
       context.commit('PvEInput', payload)
     },
+    updateLiveLimiter (context, payload = {}) {
+      const limiter = {
+        enabled: payload.enabled !== false,
+        type: payload.type || 'time',
+        value: Number(payload.value) || 1000
+      }
+      const side = payload.side || 'both'
+      if (side === 'pve' || side === 'both') {
+        context.commit('PvELimiter', limiter)
+        if (context.state.PvE && context.state.PvEEngineInstance) {
+          context.state.PvEEngineInstance.send('stop')
+          context.dispatch('goEnginePvE')
+        }
+      }
+      if ((side === 'white' || side === 'black' || side === 'both') && context.state.EvE) {
+        const cfg = { ...(context.state.EvEConfig || {}) }
+        if (side === 'white' || side === 'both') cfg.whiteLimiter = limiter
+        if (side === 'black' || side === 'both') cfg.blackLimiter = limiter
+        context.commit('EvEConfig', cfg)
+        const activeEngine = context.getters.turn ? context.state.engineWhiteInstance : context.state.engineBlackInstance
+        if (activeEngine) {
+          activeEngine.send('stop')
+          const activeLimiter = context.getters.turn ? cfg.whiteLimiter : cfg.blackLimiter
+          activeEngine.send(buildPositionCommand(context.getters.gameState))
+          activeEngine.send(limiterToGo(activeLimiter))
+        }
+      }
+      this.commit('syncGameStateFromStore')
+    },
     setDimNumber (context, payload) {
       context.commit('dimNumber', payload)
     },
@@ -965,10 +1590,114 @@ export const store = new Vuex.Store({
     setResized9x10height (context, payload) {
       context.commit('resized9x10height', payload)
     },
-    goEngine (context) {
-      engine.send('go infinite')
+    setPlayVsEngineEnabled (context, payload) {
+      context.commit('playVsEngineEnabled', payload)
+      if (payload) {
+        context.dispatch('EvEfalse')
+        context.dispatch('PvEfalse')
+      } else {
+        context.dispatch('stopEngine')
+      }
+    },
+    setPlayVsEngineHumanSide (context, payload) {
+      context.dispatch('stopEngine')
+      context.commit('playVsEngineHumanSide', payload)
+    },
+    setEngineTimeControlsEnabled (context, payload) {
+      context.commit('engineTimeControlsEnabled', payload)
+      context.commit('engineSideClockMs', null)
+    },
+    setEngineTimeControlMode (context, payload) {
+      context.commit('engineTimeControlMode', payload)
+      context.commit('engineSideClockMs', null)
+    },
+    setEngineTimeControlConfig (context, payload) {
+      context.commit('engineTimeControlConfig', payload)
+    },
+    computeEngineSearchLimits (context, payload = {}) {
+      if (!context.state.engineTimeControlsEnabled || context.state.engineTimeControlMode === 'depth') {
+        const targetDepth = context.state.analysisVisualization.analysisTargetDepth
+        const goCmd = (payload.depth || (targetDepth !== 'infinite' && Number.isFinite(Number(targetDepth))))
+          ? `go depth ${payload.depth || Number(targetDepth)}`
+          : 'go infinite'
+        return { goCmd }
+      }
+
+      const mode = context.state.engineTimeControlMode
+      const cfg = context.state.engineTimeControlConfig || {}
+      if (mode === 'perMove') {
+        const ms = Math.max(1, parseInt((cfg.perMove && cfg.perMove.seconds) || 3, 10)) * 1000
+        return { goCmd: `go movetime ${ms}` }
+      }
+      if (mode === 'movesInTime') {
+        const movesToGo = Math.max(1, parseInt((cfg.movesInTime && cfg.movesInTime.moves) || 40, 10))
+        const totalMs = Math.max(1, parseInt((cfg.movesInTime && cfg.movesInTime.minutes) || 5, 10)) * 60 * 1000
+        const clockMs = Number.isFinite(context.state.engineSideClockMs) && context.state.engineSideClockMs > 0 ? context.state.engineSideClockMs : totalMs
+        if (!Number.isFinite(context.state.engineSideClockMs) || context.state.engineSideClockMs === null) {
+          context.commit('engineSideClockMs', clockMs)
+        }
+        return { goCmd: `go movestogo ${movesToGo} wtime ${clockMs} btime ${clockMs}` }
+      }
+      const baseMs = Math.max(1, parseInt((cfg.increment && cfg.increment.baseMinutes) || 5, 10)) * 60 * 1000
+      const incMs = Math.max(0, parseInt((cfg.increment && cfg.increment.incrementSeconds) || 3, 10)) * 1000
+      const clockMs = Number.isFinite(context.state.engineSideClockMs) && context.state.engineSideClockMs > 0 ? context.state.engineSideClockMs : baseMs
+      if (!Number.isFinite(context.state.engineSideClockMs) || context.state.engineSideClockMs === null) {
+        context.commit('engineSideClockMs', clockMs)
+      }
+      return { goCmd: `go wtime ${clockMs} btime ${clockMs} winc ${incMs} binc ${incMs}` }
+    },
+    async analyzePosition (context, payload = {}) {
+      // Manual analysis action: think on the exact current board state without playing a move.
+      context.dispatch('position')
+      context.dispatch('stopEngine')
+      context.dispatch('goEngine', payload)
+    },
+    async playSingleEngineMove (context, payload = {}) {
+      // Manual single-action engine move:
+      // position -> go -> receive bestmove once -> apply exactly one move -> stop.
+      context.dispatch('stopEngine')
+      context.dispatch('position')
+
+      context.commit('nextSingleMoveRequestSeq')
+      const requestSeq = context.state.singleMoveRequestSeq
+      let handleBestMove
+      const bestMovePromise = new Promise(resolve => {
+        handleBestMove = move => resolve(move)
+        engine.on('bestmove', handleBestMove)
+      })
+
+      context.dispatch('goEngine', payload)
+
+      try {
+        const bestmove = sanitizeEngineMove(await bestMovePromise)
+        if (requestSeq !== context.state.singleMoveRequestSeq) return
+        if (!bestmove) return
+        await context.dispatch('push', { move: bestmove, prev: context.getters.currentMove[0] })
+      } catch (err) {
+        console.error('[playSingleEngineMove] Failed to apply single engine move:', err)
+      } finally {
+        if (handleBestMove) {
+          engine.off('bestmove', handleBestMove)
+        }
+        context.dispatch('stopEngine')
+      }
+    },
+    async goEngine (context, payload = {}) {
+      const { goCmd } = await context.dispatch('computeEngineSearchLimits', payload)
+      console.log('[engine-order] cmd:', goCmd)
+      engine.send(goCmd)
       context.commit('setEngineClock')
       context.commit('active', true)
+    },
+    async playVsEngineMove (context) {
+      if (!context.state.playVsEngineEnabled) return
+      const engineSide = context.state.playVsEngineHumanSide === 'white' ? 'black' : 'white'
+      const turnSide = context.getters.turn ? 'white' : 'black'
+      if (engineSide !== turnSide) return
+      await context.dispatch('playSingleEngineMove')
+    },
+    async onHumanMoveComplete (context) {
+      await context.dispatch('playVsEngineMove')
     },
     goEnginePvE (context) {
       // Send PvE engine command using the stored PvE engine instance and limiter
@@ -979,7 +1708,7 @@ export const store = new Vuex.Store({
         return
       }
       try {
-        pveEngine.send(`position fen ${context.getters.fen}`)
+        pveEngine.send(buildPositionCommand(context.getters.gameState))
         pveEngine.send(limiterToGo(pveLimiter))
       } catch (err) {
         console.error('[goEnginePvE] Failed to send position/go to PvE engine:', err)
@@ -995,13 +1724,14 @@ export const store = new Vuex.Store({
       const engineIsWhite = !playerIsWhite
       const turnIsWhite = state.turn
       const engineToMoveNow = (turnIsWhite && engineIsWhite) || (!turnIsWhite && !engineIsWhite)
-      if (state.active && state.PvE && engineToMoveNow) {
+      const move = sanitizeEngineMove(payload)
+      if (state.active && state.PvE && engineToMoveNow && move) {
         // Dispatch push and handle failure (invalid uci for current position)
-        context.dispatch('push', { move: payload, prev: context.getters.currentMove[0] }).then(() => {
+        context.dispatch('push', { move, prev: context.getters.currentMove[0] }).then(() => {
         }).catch((err) => {
           // If engine returned a move invalid for the current position, log and restart engine on the
           // current position so it recalculates for the correct state.
-          console.error('[PvEMakeMove] Engine provided invalid move for current position:', payload, err)
+          console.error('[PvEMakeMove] Engine provided invalid move for current position:', move, err)
           context.dispatch('position')
           context.dispatch('goEnginePvE')
         })
@@ -1086,7 +1816,7 @@ export const store = new Vuex.Store({
         // send position and go to the engine instance
         const sendPositionAndGo = (inst, lim) => {
           try {
-            inst.send(`position fen ${context.getters.fen}`)
+            inst.send(buildPositionCommand(context.getters.gameState))
             inst.send(limiterToGo(lim))
           } catch (err) {
             console.error('[PvE] Failed to send position/go:', err)
@@ -1100,7 +1830,9 @@ export const store = new Vuex.Store({
 
           if (!context.state.PvE || !engineToMoveNow) return
           try {
-            await context.dispatch('push', { move: ucimove, prev: context.getters.currentMove[0] })
+            const move = sanitizeEngineMove(ucimove)
+            if (!move) return
+            await context.dispatch('push', { move, prev: context.getters.currentMove[0] })
           } catch (err) {
             console.error('[PvEMakeMove] Engine provided invalid move:', ucimove, err)
             // try to restart the engine calculation on current position
@@ -1173,7 +1905,7 @@ export const store = new Vuex.Store({
         // send position and go to a specific engine instance
         const sendPositionAndGo = (inst, lim) => {
           try {
-            inst.send(`position fen ${context.getters.fen}`)
+            inst.send(buildPositionCommand(context.getters.gameState))
             inst.send(limiterToGo(lim))
           } catch (err) {
             console.error('[EvE] Failed to send position/go:', err)
@@ -1186,7 +1918,9 @@ export const store = new Vuex.Store({
           const turnIsWhite = context.getters.turn
           if (!context.state.EvE || !turnIsWhite) return
           try {
-            await context.dispatch('push', { move: ucimove, prev: context.getters.currentMove[0] })
+            const move = sanitizeEngineMove(ucimove)
+            if (!move) return
+            await context.dispatch('push', { move, prev: context.getters.currentMove[0] })
             // after white move, trigger black
             const cfg = context.state.EvEConfig || {}
             sendPositionAndGo(context.state.engineBlackInstance, cfg.blackLimiter)
@@ -1202,7 +1936,9 @@ export const store = new Vuex.Store({
           const turnIsWhite = context.getters.turn
           if (!context.state.EvE || turnIsWhite) return
           try {
-            await context.dispatch('push', { move: ucimove, prev: context.getters.currentMove[0] })
+            const move = sanitizeEngineMove(ucimove)
+            if (!move) return
+            await context.dispatch('push', { move, prev: context.getters.currentMove[0] })
             // after black move, trigger white
             const cfg = context.state.EvEConfig || {}
             sendPositionAndGo(context.state.engineWhiteInstance, cfg.whiteLimiter)
@@ -1248,7 +1984,6 @@ export const store = new Vuex.Store({
         console.error('[EvEfalse] Error stopping EvE engines:', err)
       }
       context.commit('active', false)
-      context.dispatch('resetEngineData')
     },
     stopEnginePvE (context) {
       engine.send('stop')
@@ -1271,12 +2006,14 @@ export const store = new Vuex.Store({
         context.commit('resetEngineTime')
         context.commit('active', false)
       }
-      context.dispatch('resetEngineData')
     },
     stopEngine (context) {
       engine.send('stop')
       context.commit('resetEngineTime')
       context.commit('active', false)
+      if (context.state.deepAnalysis.running) {
+        context.commit('deepAnalysisResult', { error: 'Deep analysis cancelled', cancelled: true })
+      }
     },
     restartEngine (context) {
       context.dispatch('resetEngineData')
@@ -1299,7 +2036,15 @@ export const store = new Vuex.Store({
       const normalizedFen = context.getters.normalizedFen
       const engineName = context.getters.engineName
 
-      engine.send(`position fen ${context.getters.fen}`)
+      console.log('[engine-order] cmd: position fen', context.getters.fen)
+      try {
+        engine.send(buildPositionCommand(context.getters.gameState))
+      } catch (err) {
+        console.error('[GameState] position sync mismatch. Rebuilding UI state from canonical GameState startFen.', err)
+        context.commit('fen', context.state.gameState.startFen)
+        context.dispatch('updateBoard')
+        engine.send(buildPositionCommand(context.getters.gameState))
+      }
       const eve = new CustomEvent('position', { detail: { fen: context.getters.fen } })
       document.dispatchEvent(eve)
       if (!ipcRenderer) {
@@ -1609,9 +2354,10 @@ export const store = new Vuex.Store({
       await context.dispatch('initEngineOptions')
     },
     initEngineOptions (context) {
+      const hasVariantOption = context.state.engineInfo.options.some(option => option.name === 'UCI_Variant')
       const options = {
-        // variant & 960 are handled separately and always set
-        UCI_Variant: context.getters.variant,
+        // 960 is always set; UCI_Variant only if engine supports it
+        ...(hasVariantOption ? { UCI_Variant: context.getters.variant } : {}),
         UCI_Chess960: context.state.board.is960(),
 
         // multi pv 5 is default
@@ -1637,6 +2383,9 @@ export const store = new Vuex.Store({
         if (value !== undefined && value !== null) {
           if (!filteredSettings.includes(name)) {
             context.state.engineSettings[name] = value
+          }
+          if (name === 'MultiPV' || name === 'UCI_Variant' || name === 'EvalFile') {
+            console.log('[engine-cmd] setoption', name, value)
           }
           engine.send(`setoption name ${name} value ${value}`)
         } else {
@@ -1667,9 +2416,22 @@ export const store = new Vuex.Store({
 
       // only update multipv if depth is higher than cached depth
       if (stats.isEvalCached && stats.depth <= stats.cachedDepth) return
+      const targetDepth = context.state.analysisVisualization.analysisTargetDepth
+      if (!context.state.deepAnalysis.running && context.state.active && targetDepth !== 'infinite' && Number.isFinite(Number(targetDepth)) && stats.depth >= Number(targetDepth)) {
+        context.dispatch('stopEngine')
+        context.commit('analysisMode', false)
+        return
+      }
 
       // update pvline
       if ('pv' in payload) {
+        context.commit('lastAnalysisResult', {
+          cp: typeof payload.cp === 'number' ? payload.cp : context.state.lastAnalysisResult.cp,
+          mate: typeof payload.mate === 'number' ? payload.mate : null,
+          pv: payload.pv || '',
+          ucimove: payload.pv ? payload.pv.split(/\s/)[0] : '',
+          turn: context.state.turn
+        })
         const multipv = context.getters.multipv.slice(0)
 
         // handle checkmate
@@ -1705,6 +2467,9 @@ export const store = new Vuex.Store({
               console.warn('Invalid engine pv move.\nFEN:', board.fen(), '\nPV:', payload.pv)
             }
             multipv[payload.multipv - 1] = pvline
+            if (typeof payload.multipv === 'number' && payload.multipv <= 5) {
+              console.log('[multipv] idx', payload.multipv, 'depth', payload.depth, 'uci', pvline.ucimove, 'pv', payload.pv)
+            }
           }
         }
         context.commit('multipv', multipv)
@@ -1811,6 +2576,431 @@ export const store = new Vuex.Store({
     analysisMode (context, payload) {
       context.commit('analysisMode', payload)
     },
+    async toggleAnalysisMode (context) {
+      if (context.state.active) {
+        context.dispatch('stopEngine')
+        context.commit('analysisMode', false)
+      } else if (context.state.analysisVisualization.analysisModeType === 'deep') {
+        await context.dispatch('startDeepAnalysis')
+        context.commit('analysisMode', false)
+      } else {
+        // Ensure engine options are sent before position/go so MultiPV activates reliably.
+        const topN = context.state.analysisVisualization.multiPvCount
+        const multiPvValue = typeof topN === 'number' && topN > 0 ? topN : 1
+        await context.dispatch('setEngineOptions', {
+          MultiPV: multiPvValue,
+          UCI_Variant: context.getters.variant
+        })
+        await context.dispatch('position')
+        context.dispatch('goEngine')
+        context.commit('analysisMode', true)
+      }
+    },
+    toggleEditorMode (context) {
+      const enteringEditor = !context.state.editorMode
+      if (enteringEditor && context.state.active) {
+        context.dispatch('stopEngine')
+      }
+      context.commit('editorMode', enteringEditor)
+      if (enteringEditor) {
+        context.commit('analysisMode', false)
+      } else {
+        context.commit('commitEditorPositionAsStart')
+        context.commit('reviewPrepareFullRebuild')
+        context.dispatch('resetEngineData')
+        context.dispatch('position')
+        if (context.state.analysisMode) {
+          context.dispatch('goEngine')
+        }
+      }
+    },
+    analysisVisualization (context, payload) {
+      context.commit('analysisVisualization', payload)
+    },
+    async startDeepAnalysis (context) {
+      if (context.state.deepAnalysis.running) return
+      if (context.getters.active) {
+        context.dispatch('stopEngine')
+      }
+      context.dispatch('resetEngineData')
+      context.commit('deepAnalysisStart')
+      context.commit('active', true)
+      context.commit('analysisMode', true)
+      const cfg = context.state.analysisVisualization
+      const settings = {
+        candidateCount: cfg.deepCandidateCount,
+        rootTimeMs: cfg.deepRootTimeMs,
+        timePerCandidateMs: cfg.deepTimePerCandidateMs,
+        secondaryTimeMs: cfg.deepSecondaryTimeMs,
+        depthPerCandidate: cfg.deepDepthPerCandidate,
+        clearHashBetweenCandidates: cfg.deepClearHashBetweenCandidates,
+        instabilitySensitivityCp: cfg.deepInstabilitySensitivityCp,
+        scheduleMode: cfg.deepScheduleMode,
+        maxDurationMs: cfg.deepMaxDurationMs,
+        diversityThreshold: cfg.deepDiversityThreshold
+      }
+      console.log('[deep-analysis] start', { fen: context.getters.fen, variant: context.getters.variant, settings })
+      const result = await engine.deepAnalysis({
+        fen: context.getters.fen,
+        variant: context.getters.variant,
+        settings
+      })
+      console.log('[deep-analysis] result', result)
+      context.commit('deepAnalysisResult', result)
+      context.commit('resetEngineTime')
+      context.commit('active', false)
+      context.commit('analysisMode', false)
+    },
+    clearDeepAnalysis (context) {
+      context.commit('deepAnalysisClear')
+    },
+    setReviewMarkerMode (context, payload) {
+      context.commit('reviewMarkerMode', payload)
+    },
+    previewReviewMove (context, payload) {
+      context.commit('reviewPreviewSet', payload)
+    },
+    clearReviewPreview (context) {
+      context.commit('reviewPreviewClear')
+    },
+    startReviewSequence (context) {
+      const previousInteraction = {
+        analysisMode: context.state.analysisMode,
+        editorMode: context.state.editorMode
+      }
+      if (context.state.editorMode) {
+        context.commit('editorMode', false)
+      }
+      const board = context.getters.is960
+        ? new ffish.Board(context.getters.variant, context.getters.fen, true)
+        : new ffish.Board(context.getters.variant, context.getters.fen)
+      context.commit('reviewSequenceStart', {
+        fen: context.getters.fen,
+        turn: board.turn(),
+        legalMoves: board.legalMoves(),
+        previousInteraction
+      })
+      if (context.getters.active) {
+        context.dispatch('stopEngine')
+      }
+    },
+    addReviewSequenceMove (context, move) {
+      if (!context.state.review.sequence.active || !move) return
+      const sequence = context.state.review.sequence
+      const board = context.getters.is960
+        ? new ffish.Board(context.getters.variant, sequence.fen, true)
+        : new ffish.Board(context.getters.variant, sequence.fen)
+      const legalMoves = board.legalMoves()
+      const resolvedMove = resolveReviewSequenceMove(legalMoves, move)
+      if (!resolvedMove) {
+        context.commit('reviewSetError', `임시 검토 수순에서 둘 수 없는 수입니다: ${move}`)
+        return false
+      }
+      let san = resolvedMove
+      try { san = board.sanMove(resolvedMove) } catch (err) {}
+      board.push(resolvedMove)
+      const line = sequence.line.concat(resolvedMove)
+      const sans = sequence.sans.concat(san)
+      context.commit('reviewSequenceUpdate', {
+        fen: board.fen(),
+        turn: board.turn(),
+        legalMoves: board.legalMoves(),
+        line,
+        sans,
+        lastMove: resolvedMove
+      })
+      return true
+    },
+    clearReviewSequence (context) {
+      if (!context.state.review.sequence.active) return
+      const board = context.getters.is960
+        ? new ffish.Board(context.getters.variant, context.state.review.sequence.baseFen, true)
+        : new ffish.Board(context.getters.variant, context.state.review.sequence.baseFen)
+      context.commit('reviewSequenceClear')
+      context.commit('reviewSequenceUpdate', {
+        fen: board.fen(),
+        turn: board.turn(),
+        legalMoves: board.legalMoves(),
+        line: [],
+        sans: [],
+        lastMove: null
+      })
+    },
+    cancelReviewSequence (context) {
+      context.commit('reviewSequenceEnd')
+    },
+    reviewCurrentSequence (context) {
+      const sequence = context.state.review.sequence
+      if (!sequence.active || sequence.line.length === 0) {
+        context.commit('reviewSetError', '검토할 임시 수순을 먼저 보드에서 직접 진행해 주세요.')
+        return Promise.resolve(null)
+      }
+      return context.dispatch('requestReview', {
+        mode: REVIEW_MODES.LINE,
+        fen: sequence.baseFen,
+        move: sequence.line[0],
+        moveSan: sequence.sans[0],
+        line: sequence.line,
+        markerMode: context.state.review.markerMode,
+        context: {
+          markerMode: context.state.review.markerMode,
+          sequenceSans: sequence.sans,
+          finalFen: sequence.fen,
+          temporary: true
+        }
+      })
+    },
+    async requestReview (context, payload) {
+      const reviewCfg = context.state.analysisVisualization
+      const request = createReviewRequest({
+        ...payload,
+        id: payload.id || `review-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        variant: payload.variant || context.getters.variant,
+        engineName: payload.engineName || context.getters.engineName,
+        multipv: payload.multipv || context.getters.multipv,
+        markerMode: payload.markerMode || context.state.review.markerMode,
+        context: {
+          ...(payload.context || {}),
+          reviewDepth: reviewCfg.reviewDepth,
+          tacticalDepth: reviewCfg.reviewTacticalDepth,
+          strategicHorizon: reviewCfg.reviewStrategicHorizon,
+          punishmentLineLength: reviewCfg.reviewPunishmentLineLength,
+          detailLevel: reviewCfg.reviewDetailLevel,
+          depthPreset: reviewCfg.reviewDepthPreset
+        }
+      })
+      context.commit('reviewSetRequest', request.id)
+      try {
+        request.engineAnalysis = await engine.reviewAnalysis({
+          fen: request.fen,
+          move: request.move,
+          line: request.line,
+          depth: request.context && request.context.reviewDepth ? request.context.reviewDepth : context.state.analysisVisualization.reviewDepth,
+          multiPv: 3,
+          perMoveDepth: request.context && request.context.tacticalDepth ? request.context.tacticalDepth : context.state.analysisVisualization.reviewTacticalDepth,
+          maxReviewMoves: context.state.analysisVisualization.reviewStrategicHorizon,
+          punishmentLineLength: context.state.analysisVisualization.reviewPunishmentLineLength,
+          detailLevel: context.state.analysisVisualization.reviewDetailLevel,
+          variant: request.variant
+        })
+      } catch (err) {
+        request.engineAnalysis = { error: err.message }
+      }
+      let result
+      if (ipcRenderer && ipcRenderer.invoke) {
+        result = await ipcRenderer.invoke('review-analyze', request)
+      } else {
+        result = analyzeReviewRequest(request)
+      }
+      if (context.state.review.lastRequestId !== request.id) {
+        return null
+      }
+      if (!result || result.error) {
+        context.commit('reviewSetError', result && result.error ? result.error : 'Review failed')
+        return null
+      }
+      if (request.context && request.context.deferCommit) {
+        return result
+      }
+      context.commit('reviewSetResult', result)
+      return result
+    },
+
+    async replayPlayedLineReview (context, payload = {}) {
+      const line = Array.isArray(payload.line) ? payload.line.filter(Boolean) : []
+      if (line.length === 0) {
+        context.commit('reviewSetError', '분석할 기보 수순이 없습니다. 먼저 수를 입력하거나 기보를 불러와 주세요.')
+        return Promise.resolve(null)
+      }
+      context.commit('reviewPrepareFullRebuild')
+      let result = null
+      for (let idx = 0; idx < line.length; idx++) {
+        result = await context.dispatch('reviewPlayedLine', {
+          ...payload,
+          line: line.slice(0, idx + 1),
+          sans: Array.isArray(payload.sans) ? payload.sans.slice(0, idx + 1) : [],
+          incremental: true,
+          fullRebuild: false,
+          replayFromStart: true
+        })
+        if (!result) return null
+      }
+      return result
+    },
+
+    async reviewPlayedLine (context, payload = {}) {
+      const line = Array.isArray(payload.line) ? payload.line.filter(Boolean) : []
+      if (line.length === 0) {
+        context.commit('reviewSetError', '분석할 기보 수순이 없습니다. 먼저 수를 입력하거나 기보를 불러와 주세요.')
+        return Promise.resolve(null)
+      }
+      if (payload.fullRebuild === true) {
+        return context.dispatch('replayPlayedLineReview', payload)
+      }
+      const markerMode = payload.markerMode || context.state.review.markerMode
+      const baseFen = payload.fen || context.getters.startFen
+      const fullSans = Array.isArray(payload.sans) ? payload.sans : []
+      const incrementalRequested = payload.incremental === true
+      const fullRebuild = payload.fullRebuild === true || !incrementalRequested
+      const requestContext = {
+        markerMode,
+        currentFen: context.getters.fen,
+        manualGame: Boolean(payload.manualGame),
+        source: payload.source || 'played-line',
+        sequenceSans: fullSans,
+        incrementalMode: incrementalRequested,
+        fullRebuild,
+        replayFromStart: payload.replayFromStart === true
+      }
+      if (fullRebuild) context.commit('reviewPrepareFullRebuild')
+      const previous = context.state.review.currentResult
+      const previousContext = previous && previous.requestContext ? previous.requestContext : {}
+      const previousLine = previous && Array.isArray(previous.reviewedLine) ? previous.reviewedLine : []
+      const prefixLength = reviewLinePrefixLength(previousLine, line)
+      const canExtend = incrementalRequested &&
+        previous &&
+        previous.fen === baseFen &&
+        previousContext.manualGame &&
+        prefixLength >= 2 &&
+        prefixLength === previousLine.length &&
+        prefixLength < line.length &&
+        Array.isArray(previous.moves) &&
+        previous.moves[prefixLength - 1] &&
+        previous.moves[prefixLength - 1].previewFen
+      if (canExtend) {
+        const suffixLine = line.slice(prefixLength)
+        const suffixSans = fullSans.slice(prefixLength)
+        const suffixResult = await context.dispatch('requestReview', {
+          mode: REVIEW_MODES.LINE,
+          fen: previous.moves[prefixLength - 1].previewFen,
+          move: suffixLine[0],
+          moveSan: suffixSans[0] || suffixLine[0],
+          line: suffixLine,
+          markerMode,
+          context: {
+            ...requestContext,
+            deferCommit: true,
+            incremental: true,
+            prefixLength,
+            baseFen
+          }
+        })
+        if (suffixResult) {
+          const merged = mergeIncrementalReviewResult({
+            previous,
+            suffix: suffixResult,
+            fullLine: line,
+            fullSans,
+            markerMode,
+            prefixLength,
+            requestContext
+          })
+          context.commit('reviewSetResult', merged)
+          return merged
+        }
+      }
+      if (incrementalRequested &&
+        previous &&
+        previous.fen === baseFen &&
+        previousContext.manualGame &&
+        prefixLength > 0 &&
+        prefixLength < line.length
+      ) {
+        const fullResult = await context.dispatch('requestReview', {
+          mode: REVIEW_MODES.LINE,
+          fen: baseFen,
+          move: line[0],
+          moveSan: fullSans[0] || line[0],
+          line,
+          markerMode,
+          context: {
+            ...requestContext,
+            deferCommit: true,
+            incremental: true,
+            preservePrefixLength: prefixLength
+          }
+        })
+        if (!fullResult) return null
+        const suffixResult = suffixOnlyReviewResultFromFull({ result: fullResult, prefixLength })
+        if (suffixResult && Array.isArray(suffixResult.moves) && suffixResult.moves.length) {
+          const merged = mergeIncrementalReviewResult({
+            previous,
+            suffix: suffixResult,
+            fullLine: line,
+            fullSans,
+            markerMode,
+            prefixLength,
+            requestContext
+          })
+          context.commit('reviewSetResult', merged)
+          return merged
+        }
+        context.commit('reviewSetResult', previous)
+        return previous
+      }
+      return context.dispatch('requestReview', {
+        mode: REVIEW_MODES.LINE,
+        fen: baseFen,
+        move: line[0],
+        moveSan: fullSans[0] || line[0],
+        line,
+        markerMode,
+        context: requestContext
+      })
+    },
+    reviewCurrentMove (context) {
+      const move = context.getters.currentMove[0]
+      if (!move) {
+        context.commit('reviewSetError', '검토할 기보의 수를 먼저 선택해 주세요.')
+        return Promise.resolve(null)
+      }
+      return context.dispatch('requestReview', {
+        mode: REVIEW_MODES.MOVE,
+        fen: move.prev ? move.prev.fen : context.getters.startFen,
+        move: move.uci,
+        moveSan: move.name,
+        line: [move.uci],
+        multipv: [],
+        markerMode: context.state.review.markerMode,
+        context: {
+          markerMode: context.state.review.markerMode,
+          currentFen: context.getters.fen,
+          ply: move.ply
+        }
+      })
+    },
+    reviewCustomMove (context, move) {
+      if (!move) {
+        context.commit('reviewSetError', '검토할 수를 먼저 입력해 주세요.')
+        return Promise.resolve(null)
+      }
+      return context.dispatch('requestReview', {
+        mode: REVIEW_MODES.CUSTOM_MOVE,
+        fen: context.getters.fen,
+        move,
+        line: [move],
+        markerMode: context.state.review.markerMode,
+        context: { markerMode: context.state.review.markerMode, currentFen: context.getters.fen }
+      })
+    },
+    reviewLine (context, line) {
+      const cleanLine = Array.isArray(line) ? line.filter(Boolean) : []
+      if (cleanLine.length === 0) {
+        context.commit('reviewSetError', '검토할 수순을 한 수 이상 입력해 주세요.')
+        return Promise.resolve(null)
+      }
+      return context.dispatch('requestReview', {
+        mode: REVIEW_MODES.LINE,
+        fen: context.getters.fen,
+        move: cleanLine[0],
+        line: cleanLine,
+        markerMode: context.state.review.markerMode,
+        context: { markerMode: context.state.review.markerMode, currentFen: context.getters.fen }
+      })
+    },
+    clearReview (context) {
+      context.commit('reviewClear')
+    },
     openedPGN (context, payload) {
       context.commit('openedPGN', payload)
     },
@@ -1900,6 +3090,50 @@ export const store = new Vuex.Store({
       try {
         await dispatch('initialize')
       } catch (e) {}
+    },
+
+    // Hard runtime reset: clear session/runtime state while preserving user preferences.
+    async fullResetSession ({ state, getters, commit, dispatch }) {
+      const keepVariant = state.variant
+      const selectedEngineBinary = getters.engineBinary
+      const selectedEngineCwd = getters.selectedEngine && getters.selectedEngine.cwd
+
+      // Stop all engine activity and invalidate pending single-move async responses.
+      commit('nextSingleMoveRequestSeq')
+      try { await dispatch('EvEfalse') } catch (e) {}
+      try { await dispatch('PvEfalse') } catch (e) {}
+      try { await dispatch('stopEngine') } catch (e) {}
+      try { commit('resetEngineTime') } catch (e) {}
+
+      // Clear transient runtime/session state.
+      try { dispatch('resetEngineData') } catch (e) {}
+      try { commit('clearIO') } catch (e) {}
+      try { commit('reviewClear') } catch (e) {}
+      try { commit('reviewSequenceEnd') } catch (e) {}
+      try { commit('showGameEndModal', false) } catch (e) {}
+      commit('PvE', false)
+      commit('EvE', false)
+      commit('PvEEngineInstance', null)
+      commit('engineWhiteInstance', null)
+      commit('engineBlackInstance', null)
+      commit('enginesActive', [false, false])
+      commit('active', false)
+      commit('playVsEngineEnabled', false)
+
+      // Rebuild board/session domain akin to fresh launch (preserve user settings/theme).
+      commit('variant', keepVariant)
+      commit('newBoard', { is960: false, fen: '' })
+      dispatch('updateBoard')
+      dispatch('position')
+
+      // Recreate engine runtime process instance for long-session stability.
+      if (selectedEngineBinary && selectedEngineCwd) {
+        try {
+          await dispatch('runBinary', { binary: selectedEngineBinary, cwd: selectedEngineCwd })
+        } catch (e) {
+          console.warn('[fullResetSession] Failed to recreate engine runtime:', e)
+        }
+      }
     }
   },
   getters: {
@@ -1914,6 +3148,13 @@ export const store = new Vuex.Store({
     },
     currentMove (state) {
       return state.moves.filter(moves => moves.fen === state.fen)
+    },
+    gameState (state) {
+      return {
+        ...state.gameState,
+        fen: state.fen,
+        is960: state.board && state.board.is960 && state.board.is960()
+      }
     },
     getMoveByUCIAndPrev (state, uci, prev) {
       return (uci, prev) => state.moves.filter(moves => moves.uci === uci && moves.prev === prev)
@@ -1939,6 +3180,24 @@ export const store = new Vuex.Store({
     },
     PvE (state) {
       return state.PvE
+    },
+    playVsEngineEnabled (state) {
+      return state.playVsEngineEnabled
+    },
+    playVsEngineHumanSide (state) {
+      return state.playVsEngineHumanSide
+    },
+    engineTimeControlsEnabled (state) {
+      return state.engineTimeControlsEnabled
+    },
+    engineTimeControlMode (state) {
+      return state.engineTimeControlMode
+    },
+    engineTimeControlConfig (state) {
+      return state.engineTimeControlConfig
+    },
+    engineSideClockMs (state) {
+      return state.engineSideClockMs
     },
     EvE (state) {
       return state.EvE
@@ -2029,6 +3288,9 @@ export const store = new Vuex.Store({
     engineSettings (state) {
       return state.engineSettings
     },
+    nnueStatus (state) {
+      return state.nnueStatus
+    },
     multipv (state) {
       return state.multipv
     },
@@ -2036,28 +3298,29 @@ export const store = new Vuex.Store({
       return state.hoveredpv
     },
     cp (state) {
-      return state.multipv[0].cp
+      if (typeof state.multipv[0].cp === 'number' && (state.multipv[0].pv || typeof state.multipv[0].mate === 'number')) return state.multipv[0].cp
+      return state.lastAnalysisResult.cp
     },
     wdl (state) {
       return state.multipv[0].wdl
     },
     depth (state) {
-      return state.engineStats.depth
+      return state.engineStats.depth || state.lastEngineStats.depth
     },
     nps (state) {
-      return state.engineStats.nps
+      return state.engineStats.nps || state.lastEngineStats.nps
     },
     seldepth (state) {
-      return state.engineStats.seldepth
+      return state.engineStats.seldepth || state.lastEngineStats.seldepth
     },
     nodes (state) {
-      return state.engineStats.nodes
+      return state.engineStats.nodes || state.lastEngineStats.nodes
     },
     hashfull (state) {
-      return state.engineStats.hashfull
+      return state.engineStats.hashfull || state.lastEngineStats.hashfull
     },
     tbhits (state) {
-      return state.engineStats.tbhits
+      return state.engineStats.tbhits || state.lastEngineStats.tbhits
     },
     isEvalCached (state) {
       return state.engineStats.isEvalCached
@@ -2066,20 +3329,21 @@ export const store = new Vuex.Store({
       return state.engineStats.cachedDepth
     },
     time (state) {
-      return state.engineStats.time
+      return state.engineStats.time || state.lastEngineStats.time
     },
     enginetime (state) {
       return state.enginetime
     },
     pv (state) {
-      return state.multipv[0].pv
+      return state.multipv[0].pv || state.lastAnalysisResult.pv
     },
     cpForWhite (state) {
-      return calcForSide(state.multipv[0].cp, state.turn)
+      const hasLiveCp = typeof state.multipv[0].cp === 'number' && (state.multipv[0].pv || typeof state.multipv[0].mate === 'number')
+      return hasLiveCp ? state.multipv[0].cp : state.lastAnalysisResult.cp
     },
     cpForWhiteStr (state, getters) {
       const currentMove = getters.currentMove[0]
-      const { mate } = state.multipv[0]
+      const mate = typeof state.multipv[0].mate === 'number' ? state.multipv[0].mate : state.lastAnalysisResult.mate
 
       // TODO: Update this block when ffish.board.is_terminal() or ffish.board.check_result() is available
       // Temporary fix, as lang as we don't have an `is_terminal()` or `check_result` function
@@ -2101,7 +3365,7 @@ export const store = new Vuex.Store({
       }
 
       if (typeof mate === 'number') {
-        return `#${calcForSide(mate, state.turn)}`
+        return `#${mate}`
       } else if (state.board != null && state.board.isGameOver()) {
         return state.board.result()
       } else {
@@ -2110,14 +3374,42 @@ export const store = new Vuex.Store({
     },
     cpForWhitePerc (state, getters) {
       const currentMove = getters.currentMove[0]
-      const { mate } = state.multipv[0]
+      const mate = typeof state.multipv[0].mate === 'number' ? state.multipv[0].mate : state.lastAnalysisResult.mate
       if (typeof mate === 'number') {
-        return (calcForSide(Math.sign(mate), state.turn) + 1) / 2
+        return (Math.sign(mate) + 1) / 2
       } else if (currentMove && currentMove.name.includes('#')) {
         return state.turn ? 0 : 1
       } else {
         return 1 / (1 + Math.exp(-0.003 * getters.cpForWhite))
       }
+    },
+    cpForBarPerc (state, getters) {
+      const currentMove = getters.currentMove[0]
+      const liveHasPv = Boolean(state.multipv[0] && (state.multipv[0].pv || typeof state.multipv[0].mate === 'number'))
+      const effectiveTurn = liveHasPv ? state.turn : (typeof state.lastAnalysisResult.turn === 'boolean' ? state.lastAnalysisResult.turn : state.turn)
+      const mate = typeof state.multipv[0].mate === 'number' ? state.multipv[0].mate : state.lastAnalysisResult.mate
+      if (typeof mate === 'number') {
+        // Bar visualization uses fixed board-side perspective (Cho positive),
+        // normalized from transient side-to-move engine outputs.
+        return (calcForSide(Math.sign(mate), effectiveTurn) + 1) / 2
+      } else if (currentMove && currentMove.name.includes('#')) {
+        return state.turn ? 0 : 1
+      }
+      const liveCpRaw = typeof state.multipv[0].cp === 'number' ? state.multipv[0].cp : null
+      const lastCpRaw = typeof state.lastAnalysisResult.cp === 'number' ? state.lastAnalysisResult.cp : null
+      const liveCpStable = liveCpRaw === null ? null : calcForSide(liveCpRaw, state.turn)
+      const lastCpStable = lastCpRaw === null ? null : calcForSide(lastCpRaw, typeof state.lastAnalysisResult.turn === 'boolean' ? state.lastAnalysisResult.turn : state.turn)
+
+      let stableCp = calcForSide(getters.cpForWhite, effectiveTurn)
+      // Live search can temporarily emit opposite-perspective scores.
+      // Keep bar perspective stable by anchoring sign to last completed analysis when signs conflict.
+      if (liveHasPv && liveCpStable !== null) {
+        stableCp = liveCpStable
+        if (lastCpStable !== null && Math.sign(liveCpStable) !== 0 && Math.sign(lastCpStable) !== 0 && Math.sign(liveCpStable) !== Math.sign(lastCpStable)) {
+          stableCp = Math.sign(lastCpStable) * Math.abs(liveCpStable)
+        }
+      }
+      return 1 / (1 + Math.exp(-0.003 * stableCp))
     },
     wdlForWhiteWin (state) {
       const wdl = normalizeWdl(state.multipv[0])
@@ -2242,7 +3534,7 @@ export const store = new Vuex.Store({
         return 0
       } else {
         const var2Dim = {
-          shogi: 1, xiangqi: 3, janggi: 3, makruk: 0
+          shogi: 1, xiangqi: 3, janggi: 3, janggimodern: 3, makruk: 0
         }
         return var2Dim[state.variant]
       }
@@ -2258,6 +3550,58 @@ export const store = new Vuex.Store({
     },
     analysisMode (state) {
       return state.analysisMode
+    },
+    editorMode (state) {
+      return state.editorMode
+    },
+    analysisVisualization (state) {
+      return state.analysisVisualization
+    },
+    lastAnalysisResult (state) {
+      return state.lastAnalysisResult
+    },
+    deepAnalysis (state) {
+      return state.deepAnalysis
+    },
+    review (state) {
+      return state.review
+    },
+    reviewMarkerMode (state) {
+      return state.review.markerMode
+    },
+    reviewResult (state) {
+      return state.review.currentResult
+    },
+    reviewSequence (state) {
+      return state.review.sequence
+    },
+    reviewSequenceActive (state) {
+      return state.review.sequence.active
+    },
+    reviewPreview (state) {
+      return state.review.preview
+    },
+    reviewPreviewActive (state) {
+      return Boolean(state.review.preview && state.review.preview.active)
+    },
+    reviewOverlays (state) {
+      if (state.review.preview && state.review.preview.active) {
+        return Array.isArray(state.review.preview.overlays) ? state.review.preview.overlays : []
+      }
+      const resultContext = state.review.currentResult && state.review.currentResult.requestContext ? state.review.currentResult.requestContext : {}
+      const realtimeStrategic = resultContext.source === 'realtime-played-line'
+      const resultOverlays = Array.isArray(state.review.overlays) ? state.review.overlays : []
+      const visibleResultOverlays = realtimeStrategic
+        ? primaryRealtimeBoardOverlays(
+          state.review.currentResult,
+          resultOverlays,
+          state.analysisVisualization.realtimeCommentaryArrows,
+          state.fen
+        )
+        : resultOverlays
+      const sequenceOverlays = Array.isArray(state.review.sequence.overlays) ? state.review.sequence.overlays : []
+      if (!state.review.sequence.active) return visibleResultOverlays
+      return visibleResultOverlays.length > 0 ? visibleResultOverlays : sequenceOverlays
     },
     menuAtMove (state) {
       return state.menuAtMove
@@ -2285,8 +3629,40 @@ ffish.onRuntimeInitialized = () => {
   // setup debug and error output
   engine.on('debug', (...msgs) => console.log('%c[Main Engine] Debug:', 'color: #82aaff; font-weight: 700;', ...msgs))
   engine.on('error', (...msgs) => console.error('%c[Main Engine]', 'color: #82aaff; font-weight: 700;', ...msgs))
+  engine.on('io', line => {
+    if (typeof line === 'string' && line.startsWith('info ') && line.includes(' pv ')) {
+      console.log('[engine-raw-info]', line)
+    }
+  })
   engine.on('eval-debug', (...msgs) => console.log('%c[Eval Engine] Debug:', 'color: #9580ff; font-weight: 700;', ...msgs))
   engine.on('eval-error', (...msgs) => console.error('%c[Eval Engine]', 'color: #9580ff; font-weight: 700;', ...msgs))
+  engine.on('nnue', status => {
+    store.commit('nnueStatus', status)
+    const prefix = '[NNUE]'
+    if (status.status === 'applied') {
+      console.info(prefix, `EvalFile applied: ${status.requested}`, status)
+    } else if (status.status === 'found') {
+      console.info(prefix, `EvalFile found: ${status.requested}`, status)
+    } else if (status.status === 'missing') {
+      console.warn(prefix, `EvalFile missing: ${status.requested}. Engine default network remains active.`, status)
+    } else if (status.status === 'rejected') {
+      console.error(prefix, `Engine rejected EvalFile: ${status.requested}`, status)
+    }
+  })
+  engine.on('eval-nnue', status => {
+    const prefix = '[Eval NNUE]'
+    if (status.status === 'applied') {
+      console.info(prefix, `EvalFile applied: ${status.requested}`, status)
+    } else if (status.status === 'found') {
+      console.info(prefix, `EvalFile found: ${status.requested}`, status)
+    } else if (status.status === 'missing') {
+      console.warn(prefix, `EvalFile missing: ${status.requested}. Review engine default network remains active.`, status)
+    } else if (status.status === 'rejected') {
+      console.error(prefix, `Review engine rejected EvalFile: ${status.requested}`, status)
+    }
+  })
+  engine.on('option-applied', option => console.log('[engine-option-applied]', option))
+  engine.on('eval-option-applied', option => console.log('[eval-engine-option-applied]', option))
 
   // capture engine info
   engine.on('info', info => store.dispatch('updateMultiPV', info))
