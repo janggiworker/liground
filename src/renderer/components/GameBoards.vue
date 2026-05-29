@@ -59,13 +59,86 @@
               :size="setFenSize()"
               @change="checkValidFEN"
             >
-            <div
-              v-if="opening"
-              class="opening-label"
+          <div
+            v-if="opening"
+            class="opening-label"
+          >
+            {{ opening.eco }} – {{ opening.name }}
+          </div>
+          <div class="game-sequence-row">
+            <button
+              class="mini-btn"
+              @click="copySequence"
             >
-              {{ opening.eco }} – {{ opening.name }}
+              전체 수순 복사
+            </button>
+            <button
+              class="mini-btn"
+              @click="pasteSequence"
+            >
+              수순 붙여넣기
+            </button>
+            <button
+              class="mini-btn"
+              @click="addCurrentToOpeningBook"
+            >
+              현재 기보를 오프닝북에 추가
+            </button>
+          </div>
+          <div
+            v-if="showOpeningSuggestions"
+            class="opening-candidates"
+          >
+            <div class="opening-candidates-title">
+              <span>오프닝 추천 수</span>
+              <button
+                class="candidate-detail-toggle"
+                type="button"
+                @click.stop="showOpeningCandidateDetails = !showOpeningCandidateDetails"
+              >
+                {{ showOpeningCandidateDetails ? '간단히' : '상세' }}
+              </button>
+            </div>
+            <div
+              v-for="(cand, idx) in openingCandidates.slice(0, recommendationDisplayCount)"
+              :key="`${cand.uci}-${idx}`"
+              class="candidate-card"
+              @contextmenu.prevent="removeOpeningCandidate(cand)"
+            >
+              <button
+                class="candidate-btn"
+                type="button"
+                :title="candidateUi(cand).reason"
+                @click="playCandidate(cand.uci)"
+              >
+                <span class="candidate-main">
+                  <strong>{{ cand.uci }}</strong>
+                  <span>{{ candidateUi(cand).shareText }}</span>
+                </span>
+                <span class="candidate-chips">
+                  <span class="candidate-chip weight">추천 {{ candidateUi(cand).shareText }}</span>
+                  <span class="candidate-chip practical">{{ candidateUi(cand).practicalText }}</span>
+                  <span class="candidate-chip">{{ candidateUi(cand).tag }}</span>
+                  <span class="candidate-chip">{{ candidateUi(cand).confidenceText }}</span>
+                </span>
+                <span class="candidate-reason">{{ candidateUi(cand).reason }}</span>
+              </button>
+              <div
+                v-if="showOpeningCandidateDetails"
+                class="candidate-debug"
+              >
+                <span>상대차 {{ candidateUi(cand).cpDeltaText }}</span>
+                <span>효과CP {{ candidateUi(cand).effectiveCpText }}</span>
+                <span>신뢰 {{ candidateUi(cand).confidencePercent }}</span>
+                <span>깊이 {{ candidateUi(cand).avgDepthText }}</span>
+                <span>표본 {{ candidateUi(cand).samplesText }}</span>
+                <span>변동 {{ candidateUi(cand).cpStdDevText }}</span>
+                <span>가중 {{ candidateUi(cand).qualityWeightText }}</span>
+                <span>수동 {{ candidateUi(cand).manualBoostText }}</span>
+              </div>
             </div>
           </div>
+        </div>
           <div
             v-else
             id="fen-field-qt"
@@ -146,6 +219,8 @@ import Vue from 'vue'
 import SettingsTab from './SettingsTab'
 import GameInfo from './GameInfo.vue'
 import { findBestOpeningForFen } from '../../shared/openingLookup'
+import { parseGameSequence, serializeGameSequence } from '../../shared/gameSequence'
+import { copyTextReliable, readTextReliable } from '../../shared/clipboard'
 import { mapGetters } from 'vuex'
 
 export default {
@@ -164,7 +239,9 @@ export default {
       positionInfo: '',
       game: null,
       resetAnalysis: false,
-      keydownHandler: null
+      keydownHandler: null,
+      autoReplyBusy: false,
+      showOpeningCandidateDetails: false
     }
   },
   computed: {
@@ -202,6 +279,18 @@ export default {
         }
       }
       return undefined
+    },
+    openingCandidates () {
+      return this.$store.getters.openingCandidates || []
+    },
+    openingBook () {
+      return this.$store.getters.openingBook || {}
+    },
+    recommendationDisplayCount () {
+      return Math.max(1, Math.min(8, Number(this.openingBook.recommendationCount) || 3))
+    },
+    showOpeningSuggestions () {
+      return this.openingBook.enabled && this.openingBook.showSuggestions && this.openingCandidates.length > 0
     },
     ...mapGetters(['QuickTourIndex'])
   },
@@ -258,6 +347,16 @@ export default {
           event.preventDefault()
           this.$store.dispatch('playSingleEngineMove')
         }
+        if (event.ctrlKey && keyName.toLowerCase() === 'c') {
+          const selection = window.getSelection ? window.getSelection() : null
+          if (selection && selection.toString().trim().length > 0) return
+          event.preventDefault()
+          this.copySequence()
+        }
+        if (event.ctrlKey && keyName.toLowerCase() === 'v') {
+          event.preventDefault()
+          this.pasteSequence()
+        }
         if (event.ctrlKey && keyName.toLowerCase() === 't') {
           event.preventDefault()
           const autoPlayBtn = document.getElementById('engine-auto-play-btn')
@@ -267,6 +366,11 @@ export default {
     }
     window.addEventListener('keydown', this.keydownHandler, false)
   },
+  watch: {
+    fen () {
+      this.tryAutoOpeningResponse()
+    }
+  },
   beforeDestroy () {
     if (this.keydownHandler) {
       window.removeEventListener('keydown', this.keydownHandler, false)
@@ -275,6 +379,25 @@ export default {
   methods: {
     setFenSize () {
       return this.fen.length + 3
+    },
+    candidateUi (cand) {
+      if (cand && cand.ui) return cand.ui
+      const share = Math.round(Number((cand && cand.share) || 0) * 100)
+      return {
+        shareText: `${share}%`,
+        practicalText: '실전성 -',
+        tag: '실전적',
+        confidenceText: '신뢰 보통',
+        reason: '기존 오프닝북 가중치를 기반으로 한 추천입니다.',
+        cpDeltaText: '-',
+        effectiveCpText: '-',
+        confidencePercent: '-',
+        avgDepthText: '-',
+        samplesText: '-',
+        cpStdDevText: '-',
+        qualityWeightText: '-',
+        manualBoostText: '-'
+      }
     },
     scroll (event) { // TODO: also moves back and forth when being slightly next to the board and for example over the pockets
       if (event.deltaY < 0) {
@@ -451,6 +574,74 @@ export default {
         this.$store.dispatch('position')
         this.$store.dispatch('goEngine')
       }
+      this.tryAutoOpeningResponse()
+    },
+    addCurrentToOpeningBook () {
+      this.$store.dispatch('addCurrentGameToOpeningBook')
+      alert('현재 기보를 오프닝북에 추가했습니다.')
+    },
+    playCandidate (uci) {
+      const current = this.currentMove
+      this.$store.commit('appendMoves', { move: uci, prev: current })
+      this.$store.dispatch('fen', this.$store.getters.board.fen())
+      this.$store.dispatch('updateBoard')
+      this.$store.dispatch('position')
+    },
+    removeOpeningCandidate (cand) {
+      if (!cand || !cand.uci) return
+      if (!confirm('이 수를 오프닝북에서 삭제하시겠습니까?\n[네] [아니요]')) return
+      const ok = this.$store.dispatch('deleteOpeningBookMove', {
+        parentFen: this.fen,
+        move: cand.uci
+      })
+      Promise.resolve(ok).then((done) => {
+        if (!done) alert('삭제할 수를 찾지 못했습니다.')
+      })
+    },
+    async tryAutoOpeningResponse () {
+      if (!this.openingBook.enabled || !this.openingBook.autoResponse) return
+      if (this.autoReplyBusy) return
+      if (!this.openingCandidates || this.openingCandidates.length === 0) return
+      this.autoReplyBusy = true
+      try {
+        await this.$nextTick()
+        this.$store.dispatch('playOpeningBookMove')
+      } finally {
+        setTimeout(() => { this.autoReplyBusy = false }, 120)
+      }
+    },
+    sequencePayload () {
+      return {
+        variant: this.$store.getters.variant,
+        startFen: this.$store.getters.startFen,
+        moves: this.$store.getters.currentMainlineUci,
+        metadata: {
+          exportedAt: new Date().toISOString()
+        }
+      }
+    },
+    async copySequence () {
+      const text = serializeGameSequence(this.sequencePayload())
+      const result = await copyTextReliable(text)
+      if (result.ok) {
+        alert('전체 대국 수순을 복사했습니다.')
+        return
+      }
+      alert('복사에 실패했습니다. 다른 창을 닫고 다시 시도해 주세요.')
+    },
+    async pasteSequence () {
+      const read = await readTextReliable()
+      if (!read.ok) {
+        alert('클립보드를 읽지 못했습니다.')
+        return
+      }
+      const parsed = parseGameSequence(read.text)
+      if (!parsed) {
+        alert('지원되는 수순 형식이 아닙니다.')
+        return
+      }
+      await this.$store.dispatch('loadGameSequence', parsed)
+      alert(`수순 ${parsed.moves.length}개를 불러왔습니다.`)
     },
     drawArrow (event) {
       console.log(`event: ${event}`)
@@ -559,6 +750,88 @@ input {
 #lname {
   background-color: var(--second-bg-color);
   color: var(--main-text-color)
+}
+.game-sequence-row {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+.mini-btn {
+  font-size: 11px;
+  border: 1px solid var(--main-border-color);
+  background: var(--second-bg-color);
+  color: var(--main-text-color);
+}
+.opening-candidates {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.opening-candidates-title {
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.candidate-detail-toggle {
+  font-size: 10px;
+  border: 1px solid var(--main-border-color);
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: var(--second-bg-color);
+  color: var(--second-text-color, #9aa0a6);
+}
+.candidate-card {
+  border: 1px solid var(--main-border-color);
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.06);
+  overflow: hidden;
+}
+.candidate-btn {
+  width: 100%;
+  font-size: 11px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: none;
+  background: transparent;
+  color: var(--main-text-color);
+  padding: 5px 6px;
+}
+.candidate-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.candidate-chips, .candidate-debug {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.candidate-chip {
+  border-radius: 999px;
+  padding: 1px 5px;
+  background: rgba(114, 137, 218, 0.16);
+  color: var(--main-text-color);
+}
+.candidate-chip.weight {
+  background: rgba(114, 137, 218, 0.26);
+}
+.candidate-chip.practical {
+  background: rgba(67, 181, 129, 0.18);
+}
+.candidate-reason {
+  color: var(--second-text-color, #9aa0a6);
+  line-height: 1.25;
+}
+.candidate-debug {
+  padding: 4px 6px 5px;
+  border-top: 1px solid var(--main-border-color);
+  color: var(--second-text-color, #9aa0a6);
+  font-size: 10px;
 }
 #pgnbrowser {
   grid-area: pgnbrowser;

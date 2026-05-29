@@ -5,6 +5,9 @@ import { engine, Engine } from './engine'
 import allEngines from './store/engines'
 import { createReviewRequest, emptyReviewState, emptyReviewSequenceState, REVIEW_MARKER_MODES, REVIEW_MODES } from '../shared/review/schema'
 import { analyzeReviewRequest } from '../shared/review/reviewService'
+import { buildMainlineFromMove } from '../shared/gameSequence'
+import { addSequenceToOpeningGraph, applyOpeningExplorationBias, chooseWeightedCandidate, createOpeningGraph, mergeOpeningGraphs, normalizeOpeningGraph, openingCandidatesForFen, refreshTransitionMeta } from '../shared/openingGraph'
+import { fenToEpd } from '../shared/openingLookup'
 
 import moveAudio from './assets/audio/Move.mp3'
 import captureAudio from './assets/audio/Capture.mp3'
@@ -108,6 +111,1019 @@ function normalizeFen (fen) {
     return parts.slice(0, parts.length - 2).join(' ')
   }
   return parts.join(' ')
+}
+
+
+function emptyDisplayAnalysisResult () {
+  return {
+    cp: 0,
+    mate: null,
+    pv: '',
+    ucimove: '',
+    turn: true,
+    displaySource: 'root_multipv_1',
+    displayDepth: 0,
+    displayEval: 0,
+    probeEval: null,
+    trapEval: null,
+    marginCandidateEval: null,
+    selectedPersonalityEval: null,
+    wdl: null,
+    wdlWin: null,
+    wdlDraw: null,
+    wdlLoss: null
+  }
+}
+
+const HUMAN_TRAP_DEFAULTS = {
+  enabled: false,
+  multiPv: 3,
+  preferredCpLoss: 25,
+  maxCpLoss: 40,
+  minCandidateCp: -50,
+  minPunishmentCp: 120,
+  minTrapScore: 55,
+  probeDepth: 6,
+  maxCandidates: 2,
+  maxRepliesPerCandidate: 1,
+  choiceProbeDepth: 4,
+  choiceMaxReplies: 3,
+  choiceMinLegalReplies: 6,
+  choiceMaxCorrectRatio: 0.35,
+  choiceNearBestCp: 60,
+  choiceMinPenaltyCp: 90,
+  overreactionProbeDepth: 4,
+  overreactionMaxReplies: 2,
+  overreactionMinPenaltyCp: 70,
+  pressureProbeDepth: 4,
+  pressureMaxReplies: 2,
+  pressureMinScore: 45,
+  maxProbeBudget: 6,
+  earlyTrapScore: 85
+}
+
+const CONTROLLED_MARGIN_DEFAULTS = {
+  enabled: false,
+  minWinningCp: 70,
+  maxWinningCp: 130,
+  maxCpLoss: 1200,
+  minSafetyCp: 60,
+  maxCandidates: 6,
+  hardFloorCp: 50,
+  avoidSimplification: true,
+  maxPvSimplification: 2,
+  refusalMinBestCp: 160,
+  refusalCapturePenalty: 260,
+  refusalQuietBonus: 130,
+  combinedRefusalMultiplier: 1.8,
+  combinedTensionBonus: 90,
+  combinedTrapPriorityBoost: 1.45
+}
+
+
+const HUMAN_TRAP_PIECE_VALUES = {
+  p: 100,
+  n: 320,
+  b: 330,
+  r: 500,
+  q: 900,
+  k: 0,
+  a: 300,
+  c: 300,
+  e: 300,
+  f: 300,
+  g: 300,
+  h: 300,
+  m: 300,
+  s: 300,
+  w: 300
+}
+
+function clampNumber (value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function parseEngineScoreToCp (score) {
+  if (typeof score === 'number' && Number.isFinite(score)) return score
+  if (typeof score !== 'string') return null
+  const trimmed = score.trim()
+  if (!trimmed) return null
+  if (trimmed[0] === '#') {
+    const mate = Number(trimmed.slice(1))
+    if (!Number.isFinite(mate)) return null
+    return mate > 0 ? 100000 - Math.min(9999, mate) : -100000 - Math.max(-9999, mate)
+  }
+  const cp = Number(trimmed)
+  return Number.isFinite(cp) ? cp : null
+}
+
+function normalizeTrapSettings (settings = {}) {
+  const merged = { ...HUMAN_TRAP_DEFAULTS, ...(settings || {}) }
+  return {
+    ...merged,
+    enabled: !!merged.enabled,
+    multiPv: Math.max(1, Math.min(5, Number(merged.multiPv) || HUMAN_TRAP_DEFAULTS.multiPv)),
+    preferredCpLoss: Math.max(0, Number(merged.preferredCpLoss) || HUMAN_TRAP_DEFAULTS.preferredCpLoss),
+    maxCpLoss: Math.max(1, Number(merged.maxCpLoss) || HUMAN_TRAP_DEFAULTS.maxCpLoss),
+    minCandidateCp: Number.isFinite(Number(merged.minCandidateCp)) ? Number(merged.minCandidateCp) : HUMAN_TRAP_DEFAULTS.minCandidateCp,
+    minPunishmentCp: Math.max(1, Number(merged.minPunishmentCp) || HUMAN_TRAP_DEFAULTS.minPunishmentCp),
+    minTrapScore: Math.max(1, Number(merged.minTrapScore) || HUMAN_TRAP_DEFAULTS.minTrapScore),
+    probeDepth: Math.max(4, Math.min(12, Number(merged.probeDepth) || HUMAN_TRAP_DEFAULTS.probeDepth)),
+    maxCandidates: Math.max(1, Math.min(3, Number(merged.maxCandidates) || HUMAN_TRAP_DEFAULTS.maxCandidates)),
+    maxRepliesPerCandidate: Math.max(1, Math.min(2, Number(merged.maxRepliesPerCandidate) || HUMAN_TRAP_DEFAULTS.maxRepliesPerCandidate)),
+    choiceProbeDepth: Math.max(3, Math.min(8, Number(merged.choiceProbeDepth) || HUMAN_TRAP_DEFAULTS.choiceProbeDepth)),
+    choiceMaxReplies: Math.max(1, Math.min(5, Number(merged.choiceMaxReplies) || HUMAN_TRAP_DEFAULTS.choiceMaxReplies)),
+    choiceMinLegalReplies: Math.max(2, Number(merged.choiceMinLegalReplies) || HUMAN_TRAP_DEFAULTS.choiceMinLegalReplies),
+    choiceMaxCorrectRatio: clampNumber(Number(merged.choiceMaxCorrectRatio) || HUMAN_TRAP_DEFAULTS.choiceMaxCorrectRatio, 0.1, 0.8),
+    choiceNearBestCp: Math.max(20, Number(merged.choiceNearBestCp) || HUMAN_TRAP_DEFAULTS.choiceNearBestCp),
+    choiceMinPenaltyCp: Math.max(30, Number(merged.choiceMinPenaltyCp) || HUMAN_TRAP_DEFAULTS.choiceMinPenaltyCp),
+    overreactionProbeDepth: Math.max(3, Math.min(8, Number(merged.overreactionProbeDepth) || HUMAN_TRAP_DEFAULTS.overreactionProbeDepth)),
+    overreactionMaxReplies: Math.max(1, Math.min(4, Number(merged.overreactionMaxReplies) || HUMAN_TRAP_DEFAULTS.overreactionMaxReplies)),
+    overreactionMinPenaltyCp: Math.max(30, Number(merged.overreactionMinPenaltyCp) || HUMAN_TRAP_DEFAULTS.overreactionMinPenaltyCp),
+    pressureProbeDepth: Math.max(3, Math.min(8, Number(merged.pressureProbeDepth) || HUMAN_TRAP_DEFAULTS.pressureProbeDepth)),
+    pressureMaxReplies: Math.max(1, Math.min(4, Number(merged.pressureMaxReplies) || HUMAN_TRAP_DEFAULTS.pressureMaxReplies)),
+    pressureMinScore: Math.max(20, Number(merged.pressureMinScore) || HUMAN_TRAP_DEFAULTS.pressureMinScore),
+    maxProbeBudget: Math.max(1, Math.min(12, Number(merged.maxProbeBudget) || HUMAN_TRAP_DEFAULTS.maxProbeBudget)),
+    earlyTrapScore: Math.max(40, Number(merged.earlyTrapScore) || HUMAN_TRAP_DEFAULTS.earlyTrapScore)
+  }
+}
+
+function normalizeCloseWinSettings (settings = {}) {
+  const merged = { ...CONTROLLED_MARGIN_DEFAULTS, ...(settings || {}) }
+  const minWinningCp = Math.max(50, Number(merged.minWinningCp) || CONTROLLED_MARGIN_DEFAULTS.minWinningCp)
+  const maxWinningCp = Math.max(minWinningCp + 20, Number(merged.maxWinningCp) || CONTROLLED_MARGIN_DEFAULTS.maxWinningCp)
+  return {
+    ...merged,
+    enabled: !!merged.enabled,
+    minWinningCp,
+    maxWinningCp,
+    maxCpLoss: Math.max(100, Number(merged.maxCpLoss) || CONTROLLED_MARGIN_DEFAULTS.maxCpLoss),
+    minSafetyCp: Math.max(0, Number(merged.minSafetyCp) || CONTROLLED_MARGIN_DEFAULTS.minSafetyCp),
+    maxCandidates: Math.max(2, Math.min(8, Number(merged.maxCandidates) || CONTROLLED_MARGIN_DEFAULTS.maxCandidates)),
+    hardFloorCp: Math.max(0, Number(merged.hardFloorCp) || CONTROLLED_MARGIN_DEFAULTS.hardFloorCp),
+    avoidSimplification: merged.avoidSimplification !== false,
+    maxPvSimplification: Math.max(0, Math.min(6, Number(merged.maxPvSimplification) || CONTROLLED_MARGIN_DEFAULTS.maxPvSimplification)),
+    refusalMinBestCp: Math.max(100, Number(merged.refusalMinBestCp) || CONTROLLED_MARGIN_DEFAULTS.refusalMinBestCp),
+    refusalCapturePenalty: Math.max(0, Number(merged.refusalCapturePenalty) || CONTROLLED_MARGIN_DEFAULTS.refusalCapturePenalty),
+    refusalQuietBonus: Math.max(0, Number(merged.refusalQuietBonus) || CONTROLLED_MARGIN_DEFAULTS.refusalQuietBonus),
+    combinedRefusalMultiplier: clampNumber(Number(merged.combinedRefusalMultiplier) || CONTROLLED_MARGIN_DEFAULTS.combinedRefusalMultiplier, 1, 3),
+    combinedTensionBonus: Math.max(0, Number(merged.combinedTensionBonus) || CONTROLLED_MARGIN_DEFAULTS.combinedTensionBonus),
+    combinedTrapPriorityBoost: clampNumber(Number(merged.combinedTrapPriorityBoost) || CONTROLLED_MARGIN_DEFAULTS.combinedTrapPriorityBoost, 1, 3)
+  }
+}
+
+function squareFileIndexToName (fileIndex) {
+  return String.fromCharCode('a'.charCodeAt(0) + fileIndex)
+}
+
+function parseFenPieceMap (fen) {
+  const placement = typeof fen === 'string' ? fen.trim().split(/\s+/)[0] : ''
+  const rows = placement ? placement.split('/') : []
+  const pieces = {}
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const rank = rows.length - rowIndex
+    let fileIndex = 0
+    const row = rows[rowIndex]
+    for (let i = 0; i < row.length; i++) {
+      const ch = row[i]
+      if (/\d/.test(ch)) {
+        let digits = ch
+        while (i + 1 < row.length && /\d/.test(row[i + 1])) digits += row[++i]
+        fileIndex += Number(digits) || 0
+        continue
+      }
+      if (ch === '+') {
+        const promoted = row[i + 1]
+        if (promoted) {
+          pieces[`${squareFileIndexToName(fileIndex)}${rank}`] = `+${promoted}`
+          i++
+          fileIndex++
+        }
+        continue
+      }
+      pieces[`${squareFileIndexToName(fileIndex)}${rank}`] = ch
+      fileIndex++
+    }
+  }
+  return pieces
+}
+
+function parseUciFromTo (uci) {
+  if (typeof uci !== 'string' || uci.includes('@')) return null
+  const match = uci.match(/^([a-z]\d{1,2})([a-z]\d{1,2})/i)
+  if (!match) return null
+  return { from: match[1], to: match[2] }
+}
+
+function trapPieceValue (piece) {
+  if (!piece) return 0
+  const normalized = String(piece).replace('+', '').slice(-1).toLowerCase()
+  return HUMAN_TRAP_PIECE_VALUES[normalized] || 300
+}
+
+function boardFromFen (variant, fen, is960) {
+  return is960 ? new ffish.Board(variant, fen, true) : new ffish.Board(variant, fen)
+}
+
+function detectPoisonedCaptureReplies ({ variant, is960, fen, candidateUci, settings }) {
+  const candidateMove = parseUciFromTo(candidateUci)
+  if (!candidateMove) return []
+  const board = boardFromFen(variant, fen, is960)
+  board.push(candidateUci)
+  const afterCandidateFen = board.fen()
+  const pieceMap = parseFenPieceMap(afterCandidateFen)
+  const legalMoves = board.legalMoves()
+  const replies = []
+  for (const reply of Array.isArray(legalMoves) ? legalMoves : String(legalMoves || '').split(/\s+/).filter(Boolean)) {
+    const parsed = parseUciFromTo(reply)
+    if (!parsed) continue
+    const captured = pieceMap[parsed.to]
+    if (!captured) continue
+    const capturedValue = trapPieceValue(captured)
+    const capturesMovedPiece = parsed.to === candidateMove.to
+    const movedPiece = pieceMap[candidateMove.to]
+    const movedValue = capturesMovedPiece ? trapPieceValue(movedPiece) : 0
+    const greedGain = capturedValue + (capturesMovedPiece ? Math.max(0, movedValue - 100) * 0.25 : 0)
+    if (capturedValue < 100) continue
+    if (!capturesMovedPiece && capturedValue < 300) continue
+    const trapType = capturesMovedPiece ? 'Poisoned Capture' : 'Greed Trap'
+    const humanTemptation = clampNumber((capturedValue / 600) + (capturesMovedPiece ? 0.45 : 0.25) + (reply.endsWith('q') ? 0.2 : 0), 0.25, 1.8)
+    const attractiveness = clampNumber((capturedValue / 900) + (capturesMovedPiece ? 0.25 : 0.12), 0.15, 1) * humanTemptation
+    const replyBoard = boardFromFen(variant, afterCandidateFen, is960)
+    try {
+      replyBoard.push(reply)
+      replies.push({
+        reply,
+        captured,
+        capturedValue,
+        capturesMovedPiece,
+        greedGain,
+        trapType,
+        attractiveness,
+        humanTemptation,
+        looksFree: capturesMovedPiece || capturedValue >= 300,
+        temptationValidation: {
+          attackable: true,
+          enemyAttackCoverage: 1,
+          attackableTargets: [{ square: parsed.to, reply, piece: captured, value: capturedValue, movedPieceTarget: capturesMovedPiece }],
+          validationReason: 'opponent has a legal tempting capture'
+        },
+        fenAfterReply: replyBoard.fen()
+      })
+    } catch (err) {
+      // Ignore invalid speculative reply moves from variants with unusual capture rules.
+    }
+  }
+  return replies
+    .sort((a, b) => (b.greedGain - a.greedGain) || (b.capturedValue - a.capturedValue) || (b.capturesMovedPiece - a.capturesMovedPiece) || a.reply.localeCompare(b.reply))
+    .slice(0, settings.maxRepliesPerCandidate)
+}
+
+function normalizeTrapRootCandidates (lines, fallbackBestmove, sideToMove = true) {
+  const byMove = new Map()
+  const ordered = (Array.isArray(lines) ? lines : [])
+    .filter(line => line && line.ucimove && typeof line.cp === 'number' && Number.isFinite(line.cp) && typeof line.mate !== 'number')
+    .sort((a, b) => (a.multipv || 999) - (b.multipv || 999))
+  for (const line of ordered) {
+    if (!byMove.has(line.ucimove)) {
+      byMove.set(line.ucimove, {
+        ...line,
+        rawCp: line.cp,
+        cp: calcForSide(line.cp, sideToMove)
+      })
+    }
+  }
+  if (fallbackBestmove && !byMove.has(fallbackBestmove)) {
+    byMove.set(fallbackBestmove, { ucimove: fallbackBestmove, cp: null, rawCp: null, multipv: 999 })
+  }
+  return [...byMove.values()].filter(line => typeof line.cp === 'number')
+}
+
+function adaptiveTrapTolerance (bestCp, settings, combinedMode = false) {
+  const baseMax = Math.max(1, settings.maxCpLoss)
+  const basePreferred = Math.max(0, settings.preferredCpLoss)
+  const winningCp = Math.max(0, Number(bestCp) || 0)
+  const winningBonus = winningCp <= 120 ? 0 : Math.min(combinedMode ? 520 : 300, Math.round((winningCp - 120) * (combinedMode ? 0.34 : 0.22)))
+  return {
+    maxCpLoss: baseMax + winningBonus,
+    preferredCpLoss: basePreferred + Math.round(winningBonus * 0.45),
+    adaptiveBonus: winningBonus,
+    bestCp
+  }
+}
+
+function controlledBandPosition (cp, settings) {
+  if (typeof cp !== 'number') return 'unknown'
+  if (cp < settings.minWinningCp) return 'below-band'
+  if (cp > settings.maxWinningCp) return 'above-band'
+  return 'inside-band'
+}
+
+function quietReplyScore (fen, move) {
+  const parsed = parseUciFromTo(move)
+  if (!parsed) return 0
+  const pieceMap = parseFenPieceMap(fen)
+  const moving = pieceMap[parsed.from] || ''
+  const captured = pieceMap[parsed.to]
+  if (captured) return -200
+  const kingBonus = String(moving).toLowerCase() === 'k' ? 90 : 0
+  const retreatBonus = /[18]$/.test(parsed.to) ? 20 : 0
+  const castleLike = parsed.from[0] === 'e' && ['c', 'g'].includes(parsed.to[0]) ? 35 : 0
+  return kingBonus + retreatBonus + castleLike + 10
+}
+
+
+function moveCaptureInfo (fen, move) {
+  const parsed = parseUciFromTo(move)
+  if (!parsed) return { isCapture: false, capturedValue: 0, captured: null }
+  const pieceMap = parseFenPieceMap(fen)
+  const captured = pieceMap[parsed.to] || null
+  return {
+    isCapture: !!captured,
+    capturedValue: trapPieceValue(captured),
+    captured
+  }
+}
+
+function analyzePvSimplification ({ fen, variant, is960, pvUCI, maxPlies = 6 }) {
+  const tokens = typeof pvUCI === 'string' ? pvUCI.split(/\s+/).filter(Boolean).slice(0, maxPlies) : []
+  if (!tokens.length || !fen) return { captures: 0, captureValue: 0, forcingPlies: 0, simplificationPenalty: 0, reason: 'no pv simplification evidence' }
+  let board
+  try {
+    board = boardFromFen(variant, fen, is960)
+  } catch (err) {
+    return { captures: 0, captureValue: 0, forcingPlies: 0, simplificationPenalty: 0, reason: 'pv simplification unavailable' }
+  }
+  let captures = 0
+  let captureValue = 0
+  let forcingPlies = 0
+  for (const token of tokens) {
+    const currentFen = board.fen()
+    const info = moveCaptureInfo(currentFen, token)
+    if (info.isCapture) {
+      captures++
+      captureValue += info.capturedValue
+      if (info.capturedValue >= 300) forcingPlies++
+    }
+    if (/[qrbn]$/i.test(token) && token.length > 4) forcingPlies++
+    try {
+      board.push(token)
+    } catch (err) {
+      break
+    }
+  }
+  const simplificationPenalty = captures * 18 + Math.round(captureValue / 80) + forcingPlies * 10
+  const reason = captures
+    ? `avoids ${captures} early capture${captures === 1 ? '' : 's'} (${captureValue} material)`
+    : 'keeps material tension'
+  return { captures, captureValue, forcingPlies, simplificationPenalty, reason }
+}
+
+function detectAttackableTrapTargets ({ variant, is960, fen, candidateUci = '', limit = 4 }) {
+  let board
+  try {
+    board = boardFromFen(variant, fen, is960)
+  } catch (err) {
+    return { attackable: false, enemyAttackCoverage: 0, attackableTargets: [], validationReason: 'attack map unavailable' }
+  }
+  const pieceMap = parseFenPieceMap(fen)
+  const candidateMove = parseUciFromTo(candidateUci)
+  const legal = board.legalMoves()
+  const moves = Array.isArray(legal) ? legal : String(legal || '').split(/\s+/).filter(Boolean)
+  const targets = []
+  for (const reply of moves) {
+    const parsed = parseUciFromTo(reply)
+    if (!parsed) continue
+    const targetPiece = pieceMap[parsed.to]
+    if (!targetPiece) continue
+    const targetValue = trapPieceValue(targetPiece)
+    if (targetValue < 100) continue
+    const movedPieceTarget = !!(candidateMove && parsed.to === candidateMove.to)
+    targets.push({
+      square: parsed.to,
+      reply,
+      piece: targetPiece,
+      value: targetValue,
+      movedPieceTarget
+    })
+  }
+  targets.sort((a, b) => (b.movedPieceTarget - a.movedPieceTarget) || (b.value - a.value) || a.reply.localeCompare(b.reply))
+  const selected = targets.slice(0, limit)
+  return {
+    attackable: selected.length > 0,
+    enemyAttackCoverage: targets.length,
+    attackableTargets: selected,
+    validationReason: selected.length ? 'opponent has legal capture/attack coverage on a real target' : 'no practical attackable target found'
+  }
+}
+
+
+function legalReplyCountAfterMove ({ fen, variant, is960, move }) {
+  if (!fen || !move) return null
+  try {
+    const board = boardFromFen(variant, fen, is960)
+    board.push(move)
+    const legal = board.legalMoves()
+    const moves = Array.isArray(legal) ? legal : String(legal || '').split(/\s+/).filter(Boolean)
+    return moves.length
+  } catch (err) {
+    return null
+  }
+}
+
+function controlledMarginForcingInfo ({ fen, variant, is960, move }) {
+  const legalReplies = legalReplyCountAfterMove({ fen, variant, is960, move })
+  if (legalReplies === null) return { legalReplies: null, forcingPenalty: 0, reason: 'forcing check unavailable' }
+  const forcingPenalty = legalReplies <= 2 ? 70 : (legalReplies <= 5 ? 42 : (legalReplies <= 8 ? 20 : 0))
+  return {
+    legalReplies,
+    forcingPenalty,
+    reason: forcingPenalty > 0 ? `avoids forcing line with only ${legalReplies} replies` : 'allows flexible reply choice'
+  }
+}
+
+
+function controlledMarginRefusalInfo ({ item, best, settings, fen, combinedMode = false }) {
+  const moveInfo = moveCaptureInfo(fen, item.ucimove)
+  const alreadyComfortable = best && typeof best.cp === 'number' && best.cp >= settings.refusalMinBestCp
+  const multiplier = combinedMode ? settings.combinedRefusalMultiplier : 1
+  const refusalPenalty = alreadyComfortable && moveInfo.isCapture
+    ? Math.round((settings.refusalCapturePenalty + Math.round(moveInfo.capturedValue / 5)) * multiplier)
+    : 0
+  const refusalBonus = alreadyComfortable && !moveInfo.isCapture
+    ? settings.refusalQuietBonus + (combinedMode ? settings.combinedTensionBonus : 0)
+    : 0
+  return {
+    moveInfo,
+    alreadyComfortable,
+    refusalPenalty,
+    refusalBonus,
+    delayedConversion: alreadyComfortable && !moveInfo.isCapture,
+    reason: moveInfo.isCapture && alreadyComfortable
+      ? `${combinedMode ? 'combined refusal: ' : ''}refuses immediate ${moveInfo.capturedValue} material conversion`
+      : (alreadyComfortable ? `${combinedMode ? 'combined mode ' : ''}delays conversion and keeps tension` : 'normal margin control')
+  }
+}
+
+function controlledMarginCandidateScore ({ item, best, settings, fen, variant, is960, combinedMode = false }) {
+  const bandCenter = Math.round((settings.minWinningCp + settings.maxWinningCp) / 2)
+  const inBand = item.cp >= settings.minWinningCp && item.cp <= settings.maxWinningCp
+  const belowBand = item.cp < settings.minWinningCp
+  const bandDistance = inBand ? Math.abs(item.cp - bandCenter) : Math.min(Math.abs(item.cp - settings.minWinningCp), Math.abs(item.cp - settings.maxWinningCp))
+  const refusalInfo = controlledMarginRefusalInfo({ item, best, settings, fen, combinedMode })
+  const moveInfo = refusalInfo.moveInfo
+  const pvSimplification = analyzePvSimplification({ fen, variant, is960, pvUCI: item.pvUCI, maxPlies: Math.max(2, settings.maxPvSimplification) })
+  const forcingInfo = controlledMarginForcingInfo({ fen, variant, is960, move: item.ucimove })
+  const quietTensionBonus = moveInfo.isCapture ? 0 : 62 + (combinedMode ? settings.combinedTensionBonus : 0)
+  const safeCounterplayBonus = item.cp >= settings.minWinningCp && item.cp <= settings.maxWinningCp ? 64 + (combinedMode ? 35 : 0) : (item.cp >= settings.hardFloorCp && item.cp < settings.minWinningCp ? 24 + (combinedMode ? 18 : 0) : 0)
+  const conversionPenalty = (moveInfo.isCapture ? 110 + Math.round(moveInfo.capturedValue / 12) : 0) + refusalInfo.refusalPenalty + (settings.avoidSimplification ? pvSimplification.simplificationPenalty * (combinedMode ? 2.5 : 1.8) : 0) + forcingInfo.forcingPenalty * (combinedMode ? 1.45 : 1)
+  const excessiveMarginPenalty = Math.max(0, item.cp - settings.maxWinningCp) * 1.1
+  const dangerPenalty = belowBand ? (settings.minWinningCp - item.cp) * 1.6 : 0
+  const targetScore = 235 - bandDistance - excessiveMarginPenalty - dangerPenalty
+  const score = Math.round(targetScore + quietTensionBonus + safeCounterplayBonus + refusalInfo.refusalBonus - conversionPenalty)
+  const simplificationAvoidanceReason = conversionPenalty > 0
+    ? `${moveInfo.isCapture ? 'root capture/conversion; ' : ''}${pvSimplification.reason}; ${forcingInfo.reason}; ${refusalInfo.reason}`.trim()
+    : `quiet/tension-preserving candidate; ${forcingInfo.reason}; ${refusalInfo.reason}`
+  return {
+    ...item,
+    inBand,
+    bandDistance,
+    marginReduction: Math.max(0, best.cp - item.cp),
+    quietTensionBonus,
+    safeCounterplayBonus,
+    conversionPenalty,
+    simplificationPenalty: pvSimplification.simplificationPenalty,
+    pvSimplification,
+    forcingInfo,
+    refusalInfo,
+    controlledRefusal: refusalInfo.delayedConversion,
+    simplificationAvoidanceReason,
+    controlledMarginScore: score
+  }
+}
+
+
+function chooseNaturalReplies (fen, variant, is960, limit) {
+  let board
+  try {
+    board = boardFromFen(variant, fen, is960)
+  } catch (err) {
+    return { replies: [], legalCount: 0 }
+  }
+  const legal = board.legalMoves()
+  const moves = Array.isArray(legal) ? legal : String(legal || '').split(/\s+/).filter(Boolean)
+  const pieceMap = parseFenPieceMap(fen)
+  const scored = moves.map(move => {
+    const parsed = parseUciFromTo(move)
+    const captured = parsed ? pieceMap[parsed.to] : null
+    const captureValue = trapPieceValue(captured)
+    const promotionBonus = /[qrbn]$/i.test(move) && move.length > 4 ? 180 : 0
+    const centerBonus = parsed && ['d4', 'd5', 'e4', 'e5'].includes(parsed.to) ? 35 : 0
+    return { move, naturalScore: captureValue + promotionBonus + centerBonus }
+  })
+  scored.sort((a, b) => (b.naturalScore - a.naturalScore) || a.move.localeCompare(b.move))
+  return { replies: scored.slice(0, Math.max(1, limit)), legalCount: moves.length }
+}
+
+async function evaluateReplySpace ({ engineInstance, fen, variant, is960, candidateCp, settings, sideToMove = true }) {
+  const { replies, legalCount } = chooseNaturalReplies(fen, variant, is960, settings.choiceMaxReplies)
+  if (legalCount < settings.choiceMinLegalReplies || replies.length < 2) return null
+  const evaluated = []
+  for (const item of replies) {
+    let replyFen = ''
+    try {
+      const board = boardFromFen(variant, fen, is960)
+      board.push(item.move)
+      replyFen = board.fen()
+    } catch (err) {
+      continue
+    }
+    const score = parseEngineScoreToCp(await engineInstance.evaluate(replyFen, settings.choiceProbeDepth))
+    if (score === null) continue
+    evaluated.push({ ...item, cp: calcForSide(score, sideToMove), rawCp: score })
+  }
+  if (evaluated.length < 2) return null
+  const bestReplyCp = Math.min(...evaluated.map(item => item.cp))
+  const correct = evaluated.filter(item => item.cp <= bestReplyCp + settings.choiceNearBestCp)
+  const penalties = evaluated.map(item => Math.max(0, item.cp - bestReplyCp))
+  const avgPenalty = penalties.reduce((sum, value) => sum + value, 0) / penalties.length
+  const naturalMiss = evaluated.find(item => item.cp - bestReplyCp >= settings.choiceMinPenaltyCp) || null
+  const correctRatio = correct.length / evaluated.length
+  if (!naturalMiss || correctRatio > settings.choiceMaxCorrectRatio) return null
+  const overload = clampNumber(1 - correctRatio, 0, 1)
+  const penaltyFactor = clampNumber(avgPenalty / 180, 0, 1.5)
+  const legalFactor = clampNumber(legalCount / 24, 0.25, 1.25)
+  const score = Math.round(100 * overload * penaltyFactor * legalFactor)
+  if (score < settings.minTrapScore) return null
+  const humanTemptation = clampNumber((naturalMiss.naturalScore / 500) + overload + penaltyFactor * 0.35, 0.2, 1.7)
+  return {
+    move: null,
+    type: 'Choice Overload',
+    temptingReply: naturalMiss.move,
+    cpLoss: 0,
+    expectedPunishment: Math.round(naturalMiss.cp - bestReplyCp),
+    trapScore: score,
+    humanTemptation,
+    looksFree: naturalMiss.naturalScore >= 300,
+    choicePressure: score,
+    legalReplies: legalCount,
+    sampledReplies: evaluated.length,
+    correctReplies: correct.length,
+    candidateCp
+  }
+}
+
+async function annotatePersonalityCandidates ({ engineInstance, fen, variant, is960, rootLines, settings, sideToMove = true }) {
+  const safeSettings = normalizeTrapSettings(settings)
+  if (!safeSettings.enabled || !engineInstance || !fen) return []
+  const candidates = normalizeTrapRootCandidates(rootLines, rootLines && rootLines[0] && rootLines[0].ucimove, sideToMove).slice(0, safeSettings.maxCandidates)
+  const annotations = []
+  for (const candidate of candidates) {
+    let afterCandidateFen = ''
+    try {
+      const board = boardFromFen(variant, fen, is960)
+      board.push(candidate.ucimove)
+      afterCandidateFen = board.fen()
+    } catch (err) {
+      continue
+    }
+    const overload = await evaluateReplySpace({ engineInstance, fen: afterCandidateFen, variant, is960, candidateCp: candidate.cp, settings: safeSettings, sideToMove })
+    if (overload) annotations.push({ ...overload, move: candidate.ucimove, candidateCp: candidate.cp })
+  }
+  return annotations
+}
+
+
+async function evaluateOverreactionTrap ({ engineInstance, fen, variant, is960, candidateCp, settings, sideToMove = true }) {
+  const { replies, legalCount } = chooseNaturalReplies(fen, variant, is960, Math.max(settings.overreactionMaxReplies, settings.choiceMaxReplies))
+  if (replies.length < 2 || legalCount < 4) return null
+  const evaluated = []
+  for (const item of replies.slice(0, Math.max(settings.overreactionMaxReplies, settings.choiceMaxReplies))) {
+    try {
+      const board = boardFromFen(variant, fen, is960)
+      board.push(item.move)
+      const score = parseEngineScoreToCp(await engineInstance.evaluate(board.fen(), settings.overreactionProbeDepth))
+      if (score !== null) evaluated.push({ ...item, defensiveScore: quietReplyScore(fen, item.move), cp: calcForSide(score, sideToMove), rawCp: score })
+    } catch (err) {}
+  }
+  if (evaluated.length < 2) return null
+  const bestReplyCp = Math.min(...evaluated.map(item => item.cp))
+  const overDefended = evaluated
+    .filter(item => item.defensiveScore > 0)
+    .map(item => ({ ...item, penalty: item.cp - bestReplyCp }))
+    .filter(item => item.penalty >= settings.overreactionMinPenaltyCp)
+    .sort((a, b) => (b.penalty - a.penalty) || (b.defensiveScore - a.defensiveScore) || a.move.localeCompare(b.move))
+  if (!overDefended.length) return null
+  const top = overDefended[0]
+  const apparentPressure = clampNumber((top.defensiveScore + Math.max(0, legalCount - 4) * 3) / 130, 0.25, 1.25)
+  const penaltyFactor = clampNumber(top.penalty / 160, 0, 1.4)
+  const humanTemptation = clampNumber(apparentPressure + penaltyFactor * 0.35 + (top.defensiveScore > 80 ? 0.25 : 0), 0.25, 1.6)
+  const score = Math.round(100 * apparentPressure * penaltyFactor)
+  if (score < settings.minTrapScore) return null
+  return {
+    move: null,
+    type: 'Overreaction Trap',
+    temptingReply: top.move,
+    cpLoss: 0,
+    expectedPunishment: Math.round(top.penalty),
+    trapScore: score,
+    humanTemptation,
+    looksFree: false,
+    overreactionPressure: score,
+    legalReplies: legalCount,
+    sampledReplies: evaluated.length,
+    candidateCp,
+    depth: settings.overreactionProbeDepth
+  }
+}
+
+
+async function evaluatePracticalPressure ({ engineInstance, fen, variant, is960, candidateCp, settings, sideToMove = true }) {
+  const { replies, legalCount } = chooseNaturalReplies(fen, variant, is960, settings.pressureMaxReplies)
+  if (replies.length < 2) return null
+  const evaluated = []
+  for (const item of replies) {
+    try {
+      const board = boardFromFen(variant, fen, is960)
+      board.push(item.move)
+      const score = parseEngineScoreToCp(await engineInstance.evaluate(board.fen(), settings.pressureProbeDepth))
+      if (score !== null) evaluated.push({ ...item, cp: calcForSide(score, sideToMove), rawCp: score })
+    } catch (err) {}
+  }
+  if (evaluated.length < 2) return null
+  const bestReplyCp = Math.min(...evaluated.map(item => item.cp))
+  const penalties = evaluated.map(item => Math.max(0, item.cp - bestReplyCp))
+  const avgPenalty = penalties.reduce((sum, value) => sum + value, 0) / penalties.length
+  const worstPenalty = Math.max(...penalties)
+  const correctReplies = evaluated.filter(item => item.cp <= bestReplyCp + settings.choiceNearBestCp).length
+  const asymmetry = clampNumber(1 - (correctReplies / evaluated.length), 0, 1)
+  const forcing = clampNumber((settings.pressureMaxReplies + 2 - Math.min(legalCount, settings.pressureMaxReplies + 2)) / settings.pressureMaxReplies, 0, 1)
+  const instability = clampNumber((avgPenalty + worstPenalty * 0.45) / 220, 0, 1.5)
+  const score = Math.round(100 * (0.35 + forcing * 0.3 + asymmetry * 0.35) * instability)
+  if (score < settings.pressureMinScore) return null
+  const humanTemptation = clampNumber(asymmetry + instability * 0.35 + forcing * 0.2, 0.2, 1.5)
+  const miss = evaluated
+    .map((item, idx) => ({ ...item, penalty: penalties[idx] }))
+    .sort((a, b) => (b.penalty - a.penalty) || a.move.localeCompare(b.move))[0]
+  return {
+    move: null,
+    type: 'Practical Pressure',
+    temptingReply: miss ? miss.move : '',
+    cpLoss: 0,
+    expectedPunishment: Math.round(worstPenalty),
+    trapScore: score,
+    humanTemptation,
+    looksFree: miss && miss.naturalScore >= 300,
+    practicalPressure: score,
+    replyInstability: Math.round(avgPenalty),
+    legalReplies: legalCount,
+    sampledReplies: evaluated.length,
+    correctReplies,
+    candidateCp,
+    depth: settings.pressureProbeDepth
+  }
+}
+
+function selectCloseWinMove ({ rootLines, settings, sideToMove = true, fen = '', variant = 'chess', is960 = false, combinedMode = false }) {
+  const safeSettings = normalizeCloseWinSettings(settings)
+  if (!safeSettings.enabled) return null
+  const candidates = normalizeTrapRootCandidates(rootLines, rootLines && rootLines[0] && rootLines[0].ucimove, sideToMove).slice(0, safeSettings.maxCandidates)
+  if (candidates.length < 2) return null
+  const best = candidates[0]
+  if (typeof best.cp !== 'number') return null
+  const bandPosition = controlledBandPosition(best.cp, safeSettings)
+  if (bandPosition === 'below-band') return null
+  const scored = candidates
+    .filter(item => typeof item.cp === 'number' && item.cp >= safeSettings.hardFloorCp && best.cp - item.cp <= safeSettings.maxCpLoss)
+    .filter(item => bandPosition !== 'above-band' || item.cp < best.cp)
+    .map(item => controlledMarginCandidateScore({ item, best, settings: safeSettings, fen, variant, is960, combinedMode }))
+    .sort((a, b) =>
+      (b.controlledMarginScore - a.controlledMarginScore) ||
+      (b.marginReduction - a.marginReduction) ||
+      (a.bandDistance - b.bandDistance) ||
+      ((a.multipv || 999) - (b.multipv || 999))
+    )
+  if (!scored.length || scored[0].ucimove === best.ucimove) return null
+  const selected = scored[0]
+  const averageCandidateCp = Math.round(scored.reduce((sum, item) => sum + item.cp, 0) / scored.length)
+  return {
+    move: selected.ucimove,
+    type: 'Controlled Margin',
+    reason: combinedMode
+      ? (bandPosition === 'above-band' ? 'combined controlled temptation: delay conversion and preserve bait' : 'combined controlled edge with tension and ambiguity')
+      : (bandPosition === 'above-band' ? 'margin reduction with tension preservation' : 'controlled edge inside target band'),
+    combinedPressure: combinedMode,
+    targetBand: `${safeSettings.minWinningCp}-${safeSettings.maxWinningCp}cp`,
+    currentEval: best.cp,
+    displayEval: best.cp,
+    rootBestEval: best.cp,
+    marginCandidateEval: selected.cp,
+    averageCandidateCp,
+    bandPosition,
+    marginReduction: selected.marginReduction,
+    bestCp: best.cp,
+    selectedCp: selected.cp,
+    cpLoss: best.cp - selected.cp,
+    simplificationAvoidanceReason: selected.simplificationAvoidanceReason,
+    simplificationPenalty: selected.simplificationPenalty,
+    conversionPenalty: selected.conversionPenalty,
+    tensionScore: selected.quietTensionBonus + selected.safeCounterplayBonus,
+    controlledMarginScore: selected.controlledMarginScore,
+    pvSimplification: selected.pvSimplification,
+    controlledRefusal: selected.controlledRefusal,
+    refusalInfo: selected.refusalInfo,
+    materialConversionDelayed: selected.controlledRefusal ? 1 : 0,
+    trapScore: Math.max(1, Math.min(100, selected.controlledMarginScore))
+  }
+}
+
+
+async function selectHumanTrapMove ({ engineInstance, fen, variant, is960, bestmove, rootLines, settings, sideToMove = true, controlledSettings = null }) {
+  let safeSettings = normalizeTrapSettings(settings)
+  if (!safeSettings.enabled || !engineInstance || !fen || !bestmove) return null
+  const combinedMode = !!(controlledSettings && controlledSettings.enabled)
+  if (combinedMode) {
+    safeSettings = {
+      ...safeSettings,
+      maxCandidates: Math.min(4, Math.max(safeSettings.maxCandidates + 1, 3)),
+      maxRepliesPerCandidate: Math.min(2, Math.max(safeSettings.maxRepliesPerCandidate, 2)),
+      maxProbeBudget: Math.min(10, Math.max(safeSettings.maxProbeBudget + 2, 8)),
+      minTrapScore: Math.max(35, safeSettings.minTrapScore - 20),
+      earlyTrapScore: Math.max(60, safeSettings.earlyTrapScore - 15)
+    }
+  }
+  const candidates = normalizeTrapRootCandidates(rootLines, bestmove, sideToMove).slice(0, safeSettings.maxCandidates)
+  if (!candidates.length) return null
+  const bestLine = candidates.find(item => item.ucimove === bestmove) || candidates[0]
+  if (!bestLine || typeof bestLine.cp !== 'number') return null
+  const bestCp = bestLine.cp
+  const tolerance = adaptiveTrapTolerance(bestCp, safeSettings, combinedMode)
+  const activeMaxCpLoss = tolerance.maxCpLoss
+  const activePreferredCpLoss = tolerance.preferredCpLoss
+  const activeMinCandidateCp = combinedMode ? Math.max(safeSettings.minCandidateCp, controlledSettings.hardFloorCp) : safeSettings.minCandidateCp
+  const combinedMaxTrapCp = combinedMode && controlledSettings ? controlledSettings.maxWinningCp + 220 : Infinity
+  const probeStats = { probes: 0, rejectedCandidates: 0, earlyExits: 0, attackabilityChecks: 0, skippedQuietCandidates: 0 }
+  const probeEngine = {
+    ...engineInstance,
+    evaluate: async (probeFen, depth) => {
+      probeStats.probes++
+      return engineInstance.evaluate(probeFen, depth)
+    }
+  }
+  const trapCandidates = []
+  for (const candidate of candidates) {
+    const candidateCp = candidate.cp
+    const cpLoss = bestCp - candidateCp
+    if (cpLoss < 0 || cpLoss > activeMaxCpLoss || candidateCp < activeMinCandidateCp) {
+      probeStats.rejectedCandidates++
+      continue
+    }
+    if (combinedMode && controlledSettings && candidateCp > combinedMaxTrapCp) {
+      probeStats.rejectedCandidates++
+      continue
+    }
+    const safety = clampNumber(1 - (cpLoss / activeMaxCpLoss), 0, 1)
+    const preferredWindow = Math.max(1, activeMaxCpLoss - activePreferredCpLoss)
+    const preferredSafety = cpLoss <= activePreferredCpLoss
+      ? 1
+      : clampNumber(1 - ((cpLoss - activePreferredCpLoss) / preferredWindow) * 0.35, 0.65, 1)
+    let afterCandidateFen = ''
+    try {
+      const board = boardFromFen(variant, fen, is960)
+      board.push(candidate.ucimove)
+      afterCandidateFen = board.fen()
+    } catch (err) {}
+    probeStats.attackabilityChecks++
+    const temptationValidation = afterCandidateFen
+      ? detectAttackableTrapTargets({ variant, is960, fen: afterCandidateFen, candidateUci: candidate.ucimove })
+      : { attackable: false, enemyAttackCoverage: 0, attackableTargets: [], validationReason: 'candidate position unavailable' }
+    const replies = detectPoisonedCaptureReplies({ variant, is960, fen, candidateUci: candidate.ucimove, settings: safeSettings })
+    if (!temptationValidation.attackable && replies.length === 0) {
+      probeStats.skippedQuietCandidates++
+      continue
+    }
+    for (const reply of replies) {
+      if (probeStats.probes >= safeSettings.maxProbeBudget) break
+      const evaluated = await probeEngine.evaluate(reply.fenAfterReply, safeSettings.probeDepth)
+      const postCaptureRawCp = parseEngineScoreToCp(evaluated)
+      if (postCaptureRawCp === null) continue
+      const postCaptureCp = calcForSide(postCaptureRawCp, sideToMove)
+      const punishmentCp = postCaptureCp - candidateCp
+      if (punishmentCp < safeSettings.minPunishmentCp) continue
+      const punishment = clampNumber(punishmentCp / 180, 0, 1.5)
+      const trapScore = Math.round(100 * reply.attractiveness * punishment * safety * preferredSafety)
+      if (trapScore < safeSettings.minTrapScore) continue
+      trapCandidates.push({
+        move: candidate.ucimove,
+        type: reply.trapType || 'Poisoned Capture',
+        temptingReply: reply.reply,
+        cpLoss,
+        expectedPunishment: Math.round(punishmentCp),
+        trapScore: combinedMode ? Math.round(trapScore * controlledSettings.combinedTrapPriorityBoost * (1 + (reply.humanTemptation || 0) * 0.12)) : trapScore,
+        combinedTemptation: combinedMode,
+        candidateCp,
+        bestCp,
+        captured: reply.captured,
+        capturedValue: reply.capturedValue,
+        humanTemptation: reply.humanTemptation,
+        looksFree: reply.looksFree,
+        attackableTrapTarget: true,
+        enemyAttackCoverage: reply.temptationValidation ? reply.temptationValidation.enemyAttackCoverage : 1,
+        temptationValidation: reply.temptationValidation || temptationValidation,
+        depth: safeSettings.probeDepth,
+        adaptiveTolerance: tolerance
+      })
+    }
+    if (afterCandidateFen && probeStats.probes < safeSettings.maxProbeBudget) {
+      const overload = temptationValidation.attackable
+        ? await evaluateReplySpace({ engineInstance: probeEngine, fen: afterCandidateFen, variant, is960, candidateCp, settings: safeSettings, sideToMove })
+        : null
+      if (overload) {
+        trapCandidates.push({
+          ...overload,
+          move: candidate.ucimove,
+          cpLoss,
+          bestCp,
+          candidateCp,
+          trapScore: Math.round(overload.trapScore * safety * preferredSafety * (combinedMode ? controlledSettings.combinedTrapPriorityBoost * (1 + (overload.humanTemptation || 0) * 0.12) : 1)),
+          combinedTemptation: combinedMode,
+          attackableTrapTarget: temptationValidation.attackable,
+          enemyAttackCoverage: temptationValidation.enemyAttackCoverage,
+          temptationValidation,
+          adaptiveTolerance: tolerance
+        })
+      }
+      const overreaction = (temptationValidation.attackable && probeStats.probes < safeSettings.maxProbeBudget)
+        ? await evaluateOverreactionTrap({ engineInstance: probeEngine, fen: afterCandidateFen, variant, is960, candidateCp, settings: safeSettings, sideToMove })
+        : null
+      if (overreaction) {
+        trapCandidates.push({
+          ...overreaction,
+          move: candidate.ucimove,
+          cpLoss,
+          bestCp,
+          candidateCp,
+          trapScore: Math.round(overreaction.trapScore * safety * preferredSafety * (combinedMode ? controlledSettings.combinedTrapPriorityBoost * (1 + (overreaction.humanTemptation || 0) * 0.12) : 1)),
+          combinedTemptation: combinedMode,
+          attackableTrapTarget: true,
+          enemyAttackCoverage: temptationValidation.enemyAttackCoverage,
+          temptationValidation,
+          adaptiveTolerance: tolerance
+        })
+      }
+      const pressure = (temptationValidation.attackable && probeStats.probes < safeSettings.maxProbeBudget)
+        ? await evaluatePracticalPressure({ engineInstance: probeEngine, fen: afterCandidateFen, variant, is960, candidateCp, settings: safeSettings, sideToMove })
+        : null
+      if (pressure) {
+        trapCandidates.push({
+          ...pressure,
+          move: candidate.ucimove,
+          cpLoss,
+          bestCp,
+          candidateCp,
+          trapScore: Math.round(pressure.trapScore * safety * preferredSafety * (combinedMode ? controlledSettings.combinedTrapPriorityBoost * (1 + (pressure.humanTemptation || 0) * 0.12) : 1)),
+          combinedTemptation: combinedMode,
+          attackableTrapTarget: temptationValidation.attackable,
+          enemyAttackCoverage: temptationValidation.enemyAttackCoverage,
+          temptationValidation,
+          adaptiveTolerance: tolerance
+        })
+      }
+    }
+    if (trapCandidates.some(item => item.trapScore >= safeSettings.earlyTrapScore) || probeStats.probes >= safeSettings.maxProbeBudget) {
+      probeStats.earlyExits++
+      break
+    }
+  }
+  if (!trapCandidates.length) return null
+  trapCandidates.sort((a, b) =>
+    ((b.humanTemptation || 0) - (a.humanTemptation || 0)) ||
+    (b.trapScore - a.trapScore) ||
+    (a.cpLoss - b.cpLoss) ||
+    (b.expectedPunishment - a.expectedPunishment) ||
+    a.move.localeCompare(b.move)
+  )
+  return {
+    ...trapCandidates[0],
+    probeStats,
+    probeEval: trapCandidates[0].candidateCp,
+    trapEval: trapCandidates[0].expectedPunishment,
+    displayEval: bestCp,
+    rootBestEval: bestCp
+  }
+}
+
+
+
+function personalityNoReplacementDiagnostic ({ trapSettings, marginSettings, combinedMode, rootCount, bestmove, reason }) {
+  return {
+    mode: combinedMode ? 'Combined Personality' : (marginSettings.enabled ? 'Controlled Margin Mode' : 'Human Trap Mode'),
+    type: 'No Personality Replacement',
+    selectorEntered: true,
+    humanTrapEnabled: trapSettings.enabled,
+    controlledMarginEnabled: marginSettings.enabled,
+    selected: false,
+    replacement: false,
+    bestmove,
+    rootCandidates: rootCount,
+    reason,
+    displayEval: null,
+    probeEval: null,
+    trapEval: null,
+    marginCandidateEval: null
+  }
+}
+
+async function selectPersonalityMove ({ engineInstance, fen, variant, is960, bestmove, rootLines, humanTrapSettings, closeWinSettings, sideToMove = true }) {
+  const trapSettings = normalizeTrapSettings(humanTrapSettings)
+  const marginSettings = normalizeCloseWinSettings(closeWinSettings)
+  const combinedMode = trapSettings.enabled && marginSettings.enabled
+  const rootCount = Array.isArray(rootLines) ? rootLines.filter(Boolean).length : 0
+  console.info('[Personality]', {
+    humanTrap: trapSettings.enabled,
+    controlledMargin: marginSettings.enabled,
+    selectorEntered: true,
+    combined: combinedMode,
+    rootCandidates: rootCount,
+    bestmove
+  })
+  const logHumanTrap = trap => console.info('[HumanTrap]', {
+    entered: trapSettings.enabled,
+    candidates: rootCount,
+    filtered: trap && trap.probeStats ? trap.probeStats.rejectedCandidates + trap.probeStats.skippedQuietCandidates : null,
+    probed: trap && trap.probeStats ? trap.probeStats.probes : 0,
+    selected: !!(trap && trap.move),
+    replacement: !!(trap && trap.move && trap.move !== bestmove),
+    reason: trap && trap.move ? trap.type : (rootCount ? 'no_attackable_target_or_budget_exhausted' : 'no_root_candidates')
+  })
+  const logControlledMargin = margin => console.info('[ControlledMargin]', {
+    entered: marginSettings.enabled,
+    bestEval: margin && typeof margin.bestCp === 'number' ? margin.bestCp : null,
+    selectedEval: margin && typeof margin.selectedCp === 'number' ? margin.selectedCp : null,
+    replacement: !!(margin && margin.move),
+    marginReduction: margin && typeof margin.marginReduction === 'number' ? margin.marginReduction : 0,
+    used_for_display: false,
+    reason: margin && margin.move ? margin.reason : (rootCount > 1 ? 'no_safe_margin_replacement' : 'insufficient_root_candidates')
+  })
+  if (combinedMode) {
+    const closeWin = selectCloseWinMove({ rootLines, settings: marginSettings, sideToMove, fen, variant, is960, combinedMode: true })
+    const trap = await selectHumanTrapMove({ engineInstance, fen, variant, is960, bestmove, rootLines, settings: trapSettings, sideToMove, controlledSettings: marginSettings })
+    logHumanTrap(trap)
+    logControlledMargin(closeWin)
+    if (trap && trap.move) {
+      return {
+        ...trap,
+        mode: 'Combined Personality',
+        governingConstraint: 'Controlled Margin',
+        combinedTemptation: true,
+        companionControlledMarginMove: closeWin && closeWin.move ? closeWin.move : null,
+        companionMarginReduction: closeWin && typeof closeWin.marginReduction === 'number' ? closeWin.marginReduction : null
+      }
+    }
+    if (closeWin && closeWin.move) return { ...closeWin, mode: 'Combined Personality', governingConstraint: 'Controlled Margin', combinedTemptation: true }
+    return personalityNoReplacementDiagnostic({ trapSettings, marginSettings, combinedMode, rootCount, bestmove, reason: rootCount ? 'no_combined_replacement' : 'no_root_candidates' })
+  }
+  const closeWin = selectCloseWinMove({ rootLines, settings: marginSettings, sideToMove, fen, variant, is960 })
+  logControlledMargin(closeWin)
+  if (closeWin && closeWin.move) return { ...closeWin, mode: 'Controlled Margin Mode' }
+  const trap = await selectHumanTrapMove({ engineInstance, fen, variant, is960, bestmove, rootLines, settings: trapSettings, sideToMove })
+  logHumanTrap(trap)
+  if (trap && trap.move) return { ...trap, mode: 'Human Trap Mode' }
+  return personalityNoReplacementDiagnostic({ trapSettings, marginSettings, combinedMode, rootCount, bestmove, reason: rootCount ? 'no_personality_replacement' : 'no_root_candidates' })
+}
+
+
+function personalityFlagsFromState (state) {
+  const modal = state.startGameModal || {}
+  const debug = state.enginePersonalityDebug || {}
+  const humanTrapSettings = normalizeTrapSettings({
+    ...(debug.humanTrapSettings || {}),
+    enabled: !!modal.humanTrapMode
+  })
+  const closeWinSettings = normalizeCloseWinSettings({
+    ...(debug.closeWinSettings || {}),
+    enabled: !!modal.closeWinMode
+  })
+  return {
+    humanTrapSettings,
+    closeWinSettings,
+    enabled: humanTrapSettings.enabled || closeWinSettings.enabled
+  }
+}
+
+function collectRootInfoLine (rootLines, info) {
+  if (!info || !('pv' in info)) return
+  const rank = Number(info.multipv) || 1
+  const ucimove = typeof info.pv === 'string' ? info.pv.split(/\s+/)[0] : ''
+  if (!ucimove) return
+  rootLines[rank - 1] = {
+    multipv: rank,
+    cp: info.cp,
+    mate: info.mate,
+    depth: info.depth,
+    pvUCI: info.pv,
+    ucimove
+  }
 }
 
 function normalizedMoveLineFromHistory (moves) {
@@ -532,6 +1548,33 @@ function sanitizeEngineMove (move) {
   return String(move || '').trim().split(/\s+/)[0] || ''
 }
 
+
+const JANGGI_STANDARD_16_BACK_RANKS = [
+  'NBA1ABN',
+  'NBA1ANB',
+  'BNA1ABN',
+  'BNA1ANB'
+]
+
+function janggiStandard16OpeningPositions (variant = 'janggi') {
+  // Fairy-Stockfish/Liground Janggi uses N/n for horses and B/b for elephants
+  // (see piece CSS horse/elephant mappings and the built-in Janggi FEN style).
+  // Each side independently chooses one of four valid horse-elephant back-rank
+  // arrangements, producing 4 x 4 = 16 deterministic start positions.
+  const safeVariant = variant || 'janggi'
+  const rows = []
+  JANGGI_STANDARD_16_BACK_RANKS.forEach((blackBackRank, blackIndex) => {
+    JANGGI_STANDARD_16_BACK_RANKS.forEach((redBackRank, redIndex) => {
+      rows.push({
+        name: `Standard 16 ${blackIndex + 1}-${redIndex + 1}`,
+        variant: safeVariant,
+        fen: `r${blackBackRank.toLowerCase()}r/4k4/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/4K4/R${redBackRank}R w - - 0 1`
+      })
+    })
+  })
+  return rows
+}
+
 export const store = new Vuex.Store({
   state: {
     engineIndex: 1,
@@ -545,6 +1588,24 @@ export const store = new Vuex.Store({
     PvEInput: 1000,
     PvELimiter: null, // stores the limiter config for the PvE engine
     PvEEngineInstance: null,
+    humanTrapDiagnostics: null,
+    enginePersonalityDebug: {
+      trapSelections: 0,
+      closeWinSelections: 0,
+      trapAttempts: 0,
+      categorySelections: {},
+      replacementSelections: 0,
+      combinedSelections: 0,
+      controlledMarginReductions: 0,
+      controlledMarginReductionCp: 0,
+      controlledRefusals: 0,
+      controlledMarginBestCpTotal: 0,
+      controlledMarginSelectedCpTotal: 0,
+      controlledMarginAverageBestCp: 0,
+      controlledMarginAverageSelectedCp: 0,
+      humanTrapSettings: {},
+      closeWinSettings: {}
+    },
     playVsEngineEnabled: false,
     playVsEngineHumanSide: 'white',
     engineTimeControlsEnabled: false,
@@ -598,7 +1659,9 @@ export const store = new Vuex.Store({
       blackLimiterEnabled: true,
       blackLimiterType: 'time',
       blackLimiterValue: 1000,
-      showEndGameModal: true
+      showEndGameModal: true,
+      humanTrapMode: false,
+      closeWinMode: false
     },
     showGameEndModal: false,
     gameResult: null,
@@ -671,7 +1734,7 @@ export const store = new Vuex.Store({
         ucimove: ''
       }
     ],
-    lastAnalysisResult: { cp: 0, mate: null, pv: '', ucimove: '', turn: true },
+    lastAnalysisResult: emptyDisplayAnalysisResult(),
     numberOfEngines: [
       {
         number: 1
@@ -693,6 +1756,56 @@ export const store = new Vuex.Store({
     analysisMode: true,
     editorMode: false,
     review: emptyReviewState(),
+    openingGraph: createOpeningGraph(),
+    openingBook: {
+      enabled: true,
+      showSuggestions: true,
+      autoResponse: false,
+      autoResponseTopK: 3,
+      recommendationCount: 3,
+      useStandard16OpeningSet: false,
+      standard16SelectionMode: 'cycle',
+      autoResponseTemperature: 0.9,
+      autoGenerateEnabled: false,
+      autoGenerateIterations: 8,
+      autoGenerateMaxPlies: 16,
+      autoGenerateTopK: 3,
+      autoGenerateEarlyPlies: 10,
+      autoGenerateTemperature: 1.0
+      ,
+      autoGenerateDepth: 12,
+      autoGenerateCpThreshold: 50,
+      autoGenerateMinTrustedCount: 2,
+      useStartPool: true,
+      autoGenerateUnlimited: false,
+      autoGenerateMinCountForRecommendation: 3,
+      earlyRandomEnabled: true,
+      moveSelectionPolicy: 'practical',
+      cleanupUseQualityFilter: false,
+      cleanupCpDelta: 120
+    },
+    openingGeneration: {
+      running: false,
+      stopRequested: false,
+      analysisActive: false,
+      sessionId: 0,
+      optionSyncKey: '',
+      completedGames: 0,
+      completedMoves: 0,
+      currentDepth: 0,
+      currentMove: '',
+      currentStart: '',
+      savedBranches: 0,
+      lastStopReason: '',
+      lastStopDetail: ''
+    },
+    openingBookPersist: {
+      queued: false,
+      pendingCommits: 0,
+      lastFlushedAt: 0,
+      lastSnapshotAt: 0
+    },
+    openingStartPool: [],
     analysisVisualization: {
       showMultiPvArrows: true,
       multiPvCount: 3,
@@ -854,6 +1967,90 @@ export const store = new Vuex.Store({
     PvEEngineInstance (state, payload) {
       state.PvEEngineInstance = payload
     },
+    humanTrapDiagnostics (state, payload) {
+      state.humanTrapDiagnostics = payload || null
+    },
+    personalityDiagnostics (state, payload) {
+      const diag = payload || null
+      state.humanTrapDiagnostics = diag
+      if (diag) {
+        const debug = { ...(state.enginePersonalityDebug || {}) }
+        debug.selectorPasses = (debug.selectorPasses || 0) + 1
+        if (!diag.move && diag.type === 'No Personality Replacement') {
+          console.info('[engine-personality]', {
+            mode: diag.mode,
+            type: diag.type,
+            selectorEntered: diag.selectorEntered,
+            humanTrapEnabled: diag.humanTrapEnabled,
+            controlledMarginEnabled: diag.controlledMarginEnabled,
+            replacement: false,
+            reason: diag.reason,
+            rootCandidates: diag.rootCandidates
+          })
+          state.enginePersonalityDebug = debug
+          return
+        }
+        if (diag.type === 'Controlled Margin') {
+          debug.closeWinSelections = (debug.closeWinSelections || 0) + 1
+          if (typeof diag.marginReduction === 'number' && diag.marginReduction > 0) {
+            debug.controlledMarginReductions = (debug.controlledMarginReductions || 0) + 1
+            debug.controlledMarginReductionCp = (debug.controlledMarginReductionCp || 0) + diag.marginReduction
+          }
+          if (diag.controlledRefusal) {
+            debug.controlledRefusals = (debug.controlledRefusals || 0) + 1
+          }
+          if (typeof diag.bestCp === 'number' && typeof diag.selectedCp === 'number') {
+            debug.controlledMarginBestCpTotal = (debug.controlledMarginBestCpTotal || 0) + diag.bestCp
+            debug.controlledMarginSelectedCpTotal = (debug.controlledMarginSelectedCpTotal || 0) + diag.selectedCp
+            const count = Math.max(1, debug.closeWinSelections || 1)
+            debug.controlledMarginAverageBestCp = Math.round(debug.controlledMarginBestCpTotal / count)
+            debug.controlledMarginAverageSelectedCp = Math.round(debug.controlledMarginSelectedCpTotal / count)
+          }
+        } else debug.trapSelections = (debug.trapSelections || 0) + 1
+        debug.replacementSelections = (debug.replacementSelections || 0) + 1
+        if (diag.mode === 'Combined Personality') debug.combinedSelections = (debug.combinedSelections || 0) + 1
+        const categorySelections = { ...(debug.categorySelections || {}) }
+        const key = diag.type || 'Unknown'
+        categorySelections[key] = (categorySelections[key] || 0) + 1
+        debug.categorySelections = categorySelections
+        if (diag.type === 'Controlled Margin') {
+          console.info('[ControlledMargin]', {
+            selectedEval: diag.selectedCp,
+            used_for_display: false,
+            replacement: !!diag.move,
+            marginReduction: diag.marginReduction
+          })
+        } else {
+          console.info('[HumanTrap]', {
+            trapEval: diag.trapEval,
+            used_for_display: false,
+            replacement: !!diag.move,
+            type: diag.type
+          })
+        }
+        console.info('[engine-personality]', {
+          mode: diag.mode,
+          type: diag.type,
+          displayEval: diag.displayEval,
+          rootBestEval: diag.rootBestEval,
+          probeEval: diag.probeEval,
+          trapEval: diag.trapEval,
+          marginCandidateEval: diag.marginCandidateEval,
+          bestCp: diag.bestCp,
+          selectedCp: diag.selectedCp,
+          marginReduction: diag.marginReduction,
+          probeStats: diag.probeStats,
+          attackableTrapTarget: diag.attackableTrapTarget,
+          enemyAttackCoverage: diag.enemyAttackCoverage,
+          temptationValidation: diag.temptationValidation,
+          simplificationAvoidanceReason: diag.simplificationAvoidanceReason
+        })
+        state.enginePersonalityDebug = debug
+      }
+    },
+    enginePersonalityDebug (state, payload) {
+      state.enginePersonalityDebug = { ...(state.enginePersonalityDebug || {}), ...(payload || {}) }
+    },
     playVsEngineEnabled (state, payload) {
       state.playVsEngineEnabled = !!payload
     },
@@ -904,7 +2101,18 @@ export const store = new Vuex.Store({
       state.gameConfig = payload
     },
     startGameModal (state, payload) {
-      state.startGameModal = Object.assign({}, state.startGameModal || {}, payload)
+      const before = state.startGameModal || {}
+      state.startGameModal = Object.assign({}, before, payload)
+      if (payload && ('humanTrapMode' in payload || 'closeWinMode' in payload)) {
+        console.info('[Personality]', {
+          selectorEntered: false,
+          settingsChanged: true,
+          humanTrap: !!state.startGameModal.humanTrapMode,
+          controlledMargin: !!state.startGameModal.closeWinMode
+        })
+        if ('humanTrapMode' in payload) console.info('[HumanTrap]', { entered: !!state.startGameModal.humanTrapMode, selected: 'n/a', reason: 'setting_changed' })
+        if ('closeWinMode' in payload) console.info('[ControlledMargin]', { entered: !!state.startGameModal.closeWinMode, selected: 'n/a', reason: 'setting_changed' })
+      }
     },
     showGameEndModal (state, payload) {
       state.showGameEndModal = payload
@@ -1012,12 +2220,13 @@ export const store = new Vuex.Store({
       state.lastAnalysisResult = { ...state.lastAnalysisResult, ...(payload || {}) }
     },
     multipv (state, payload) {
-      for (const pvline of payload) {
+      const nextPayload = Array.isArray(payload) ? payload.slice() : []
+      for (const pvline of nextPayload) {
         if (pvline) {
           pvline.cpDisplay = typeof pvline.mate === 'number' ? `#${pvline.mate}` : cpToString(pvline.cp)
         }
       }
-      state.multipv = payload
+      state.multipv = nextPayload
     },
     hoveredpv (state, payload) {
       state.hoveredpv = payload
@@ -1070,7 +2279,7 @@ export const store = new Vuex.Store({
       state.startFen = state.board.fen()
       state.selectedGame = null
       state.fenply = 1
-      state.lastAnalysisResult = { cp: 0, mate: null, pv: '', ucimove: '', turn: true }
+      state.lastAnalysisResult = emptyDisplayAnalysisResult()
       state.lastEngineStats = { depth: 0, seldepth: 0, nodes: 0, nps: 0, hashfull: 0, tbhits: 0, time: 0 }
       this.commit('resetEngineStats')
       state.normalizedFen = normalizeFen(state.fen)
@@ -1083,7 +2292,7 @@ export const store = new Vuex.Store({
       this.commit('newBoard', payload)
       state.selectedGame = null
       state.moves = []
-      state.lastAnalysisResult = { cp: 0, mate: null, pv: '', ucimove: '', turn: true }
+      state.lastAnalysisResult = emptyDisplayAnalysisResult()
       state.lastEngineStats = { depth: 0, seldepth: 0, nodes: 0, nps: 0, hashfull: 0, tbhits: 0, time: 0 }
       this.commit('syncGameStateFromStore')
     },
@@ -1152,6 +2361,18 @@ export const store = new Vuex.Store({
     loadedGames (state, payload) {
       state.loadedGames = payload
       state.selectedGame = null
+    },
+    openingGraph (state, payload) {
+      state.openingGraph = payload || createOpeningGraph()
+    },
+    openingBook (state, payload) {
+      const next = { ...state.openingBook, ...(payload || {}) }
+      next.recommendationCount = Math.max(1, Math.min(8, Number(next.recommendationCount) || 3))
+      next.standard16SelectionMode = next.standard16SelectionMode === 'random' ? 'random' : 'cycle'
+      state.openingBook = next
+    },
+    openingGeneration (state, payload) {
+      state.openingGeneration = { ...state.openingGeneration, ...(payload || {}) }
     },
     rounds (state, payload) {
       state.rounds = payload
@@ -1516,6 +2737,65 @@ export const store = new Vuex.Store({
     }
   },
   actions: { // async
+    scheduleOpeningBookPersist (context, payload = {}) {
+      const immediate = payload.immediate === true
+      const state = context.state.openingBookPersist || { queued: false, pendingCommits: 0, lastFlushedAt: 0 }
+      state.pendingCommits = (state.pendingCommits || 0) + 1
+      context.state.openingBookPersist = state
+      if (immediate) {
+        return context.dispatch('persistOpeningBookFlush')
+      }
+      if (state.queued) return
+      state.queued = true
+      const now = Date.now()
+      const elapsedSinceFlush = state.lastFlushedAt ? (now - state.lastFlushedAt) : null
+      const graph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+      console.log('[opening-book] persist queued', {
+        queuedCommitCount: state.pendingCommits,
+        graphSizeEstimate: Object.keys(graph.transitions || {}).length,
+        elapsedSinceLastFlushMs: elapsedSinceFlush
+      })
+      const delayMs = (context.state.openingGeneration && context.state.openingGeneration.running) ? 1500 : 400
+      setTimeout(() => context.dispatch('persistOpeningBookFlush'), delayMs)
+    },
+    persistOpeningBookFlush (context) {
+      const state = context.state.openingBookPersist || { queued: false, pendingCommits: 0, lastFlushedAt: 0 }
+      if (!state.queued && !state.pendingCommits) return
+      state.queued = false
+      const now = Date.now()
+      const elapsedSinceFlush = state.lastFlushedAt ? (now - state.lastFlushedAt) : null
+      const queuedCommitCount = state.pendingCommits || 0
+      state.pendingCommits = 0
+      state.lastFlushedAt = now
+      context.state.openingBookPersist = state
+      try {
+        const graph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+        localStorage.setItem('openingBookGraph', JSON.stringify(graph))
+        localStorage.setItem('openingBookConfig', JSON.stringify(context.state.openingBook || {}))
+        localStorage.setItem('openingStartPool', JSON.stringify(context.state.openingStartPool || []))
+        if (!state.lastSnapshotAt || now - state.lastSnapshotAt > 5 * 60 * 1000) {
+          const snapshot = {
+            format: 'LIGROUND-OPENING-BOOK',
+            version: 2,
+            exportedAt: new Date().toISOString(),
+            config: context.state.openingBook || {},
+            graph,
+            startPool: context.state.openingStartPool || []
+          }
+          localStorage.setItem('openingBookAutosave3', localStorage.getItem('openingBookAutosave2') || '')
+          localStorage.setItem('openingBookAutosave2', localStorage.getItem('openingBookAutosave1') || '')
+          localStorage.setItem('openingBookAutosave1', JSON.stringify(snapshot))
+          state.lastSnapshotAt = now
+        }
+        console.log('[opening-book] persist flushed', {
+          queuedCommitCount,
+          graphSizeEstimate: Object.keys(graph.transitions || {}).length,
+          elapsedSinceLastFlushMs: elapsedSinceFlush
+        })
+      } catch (err) {
+      // Ignore invalid speculative reply moves from variants with unusual capture rules.
+    }
+    },
     movesChangeDummy (context, payload) {
       context.commit('movesChangeDummy', payload)
     },
@@ -1564,6 +2844,7 @@ export const store = new Vuex.Store({
           localStorage.removeItem('engines')
         }
       }
+      context.dispatch('loadOpeningBookFromStorage')
       context.commit('newBoard')
       context.dispatch('updateBoard')
       context.dispatch('changeEngine', context.getters.availableEngines[0].name)
@@ -1639,6 +2920,8 @@ export const store = new Vuex.Store({
       context.commit('deleteFromMoves', payload)
     },
     resetEngineData (context) {
+      context.commit('humanTrapDiagnostics', null)
+      context.commit('enginePersonalityDebug', { trapAttempts: 0, trapSelections: 0, closeWinSelections: 0, replacementSelections: 0, combinedSelections: 0, controlledMarginReductions: 0, controlledMarginReductionCp: 0, controlledRefusals: 0, controlledMarginBestCpTotal: 0, controlledMarginSelectedCpTotal: 0, controlledMarginAverageBestCp: 0, controlledMarginAverageSelectedCp: 0, categorySelections: {} })
       context.commit('resetMultiPV')
       context.commit('resetEngineStats')
       context.commit('resetWdlCache')
@@ -1769,18 +3052,46 @@ export const store = new Vuex.Store({
 
       context.commit('nextSingleMoveRequestSeq')
       const requestSeq = context.state.singleMoveRequestSeq
+      const personality = personalityFlagsFromState(context.state)
+      const rootFen = context.getters.fen
+      let rootLines = []
       let handleBestMove
+      let handleInfo
       const bestMovePromise = new Promise(resolve => {
         handleBestMove = move => resolve(move)
         engine.on('bestmove', handleBestMove)
       })
+      if (personality.enabled) {
+        handleInfo = info => collectRootInfoLine(rootLines, info)
+        engine.on('info', handleInfo)
+      }
 
       context.dispatch('goEngine', payload)
 
       try {
-        const bestmove = sanitizeEngineMove(await bestMovePromise)
+        let bestmove = sanitizeEngineMove(await bestMovePromise)
         if (requestSeq !== context.state.singleMoveRequestSeq) return
         if (!bestmove) return
+        if (personality.enabled) {
+          context.commit('enginePersonalityDebug', { trapAttempts: (context.state.enginePersonalityDebug.trapAttempts || 0) + 1 })
+          const selected = await selectPersonalityMove({
+            engineInstance: engine,
+            fen: rootFen,
+            variant: context.getters.variant,
+            is960: context.getters.is960,
+            bestmove,
+            rootLines: rootLines.filter(Boolean),
+            humanTrapSettings: personality.humanTrapSettings,
+            closeWinSettings: personality.closeWinSettings,
+            sideToMove: context.getters.turn
+          })
+          if (selected && selected.move && context.state.board.legalMoves().includes(selected.move) && normalizeFen(context.getters.fen) === normalizeFen(rootFen)) {
+            bestmove = selected.move
+            context.commit('personalityDiagnostics', { ...selected, selectedAt: Date.now() })
+          } else if (selected) {
+            context.commit('personalityDiagnostics', { ...selected, selectedAt: Date.now() })
+          }
+        }
         await context.dispatch('push', { move: bestmove, prev: context.getters.currentMove[0] })
       } catch (err) {
         console.error('[playSingleEngineMove] Failed to apply single engine move:', err)
@@ -1788,11 +3099,43 @@ export const store = new Vuex.Store({
         if (handleBestMove) {
           engine.off('bestmove', handleBestMove)
         }
+        if (handleInfo) engine.off('info', handleInfo)
         context.dispatch('stopEngine')
       }
     },
     async goEngine (context, payload = {}) {
+      const source = payload && payload.source ? payload.source : 'unknown'
+      if (context.state.openingGeneration && context.state.openingGeneration.running) {
+        console.warn('[engine-guard] goEngine blocked during opening-generation session', { source, payload })
+        return
+      }
       const { goCmd } = await context.dispatch('computeEngineSearchLimits', payload)
+      const personality = personalityFlagsFromState(context.state)
+      if (personality.enabled) {
+        console.info('[Personality]', {
+          humanTrap: personality.humanTrapSettings.enabled,
+          controlledMargin: personality.closeWinSettings.enabled,
+          selectorEntered: true,
+          phase: 'analysis-search-start',
+          source
+        })
+        if (personality.humanTrapSettings.enabled) {
+          console.info('[HumanTrap]', { entered: true, candidates: 0, filtered: 0, probed: 0, selected: 'pending', reason: 'awaiting_root_bestmove' })
+        }
+        if (personality.closeWinSettings.enabled) {
+          console.info('[ControlledMargin]', { entered: true, bestEval: null, selected: 'pending', reason: 'awaiting_root_bestmove' })
+        }
+        context.commit('humanTrapDiagnostics', {
+          mode: 'Engine Personality',
+          type: 'Selector Active',
+          selectorEntered: true,
+          humanTrapEnabled: personality.humanTrapSettings.enabled,
+          controlledMarginEnabled: personality.closeWinSettings.enabled,
+          reason: 'analysis_root_search_started',
+          selectedAt: Date.now()
+        })
+        engine.send(`setoption name MultiPV value ${Math.max(personality.humanTrapSettings.multiPv, personality.closeWinSettings.maxCandidates)}`)
+      }
       console.log('[engine-order] cmd:', goCmd)
       engine.send(goCmd)
       context.commit('setEngineClock')
@@ -1880,6 +3223,17 @@ export const store = new Vuex.Store({
         const playerIsWhite = payload && typeof payload.playerIsWhite !== 'undefined' ? payload.playerIsWhite : true
         const engineName = payload.engine
         const pveLimiter = payload.pveLimiter
+        const personality = personalityFlagsFromState(context.state)
+        const humanTrapSettings = normalizeTrapSettings({
+          ...personality.humanTrapSettings,
+          ...(payload.humanTrapSettings || {}),
+          enabled: !!(payload.humanTrapMode || (context.state.startGameModal && context.state.startGameModal.humanTrapMode))
+        })
+        const closeWinSettings = normalizeCloseWinSettings({
+          ...personality.closeWinSettings,
+          ...(payload.closeWinSettings || {}),
+          enabled: !!(payload.closeWinMode || (context.state.startGameModal && context.state.startGameModal.closeWinMode))
+        })
 
         // Stop old PvE engine if it exists to avoid listener conflicts
         if (context.state.PvEEngineInstance) {
@@ -1909,6 +3263,17 @@ export const store = new Vuex.Store({
         try {
           pveEngine.send(variantCmd)
           pveEngine.send(chess960Cmd)
+          if (humanTrapSettings.enabled || closeWinSettings.enabled) {
+            console.info('[Personality]', {
+              humanTrap: humanTrapSettings.enabled,
+              controlledMargin: closeWinSettings.enabled,
+              selectorEntered: true,
+              phase: 'pve-configured'
+            })
+            if (humanTrapSettings.enabled) console.info('[HumanTrap]', { entered: true, candidates: 0, filtered: 0, probed: 0, selected: 'pending', reason: 'pve_waiting_for_engine_turn' })
+            if (closeWinSettings.enabled) console.info('[ControlledMargin]', { entered: true, bestEval: null, selected: 'pending', reason: 'pve_waiting_for_engine_turn' })
+            pveEngine.send(`setoption name MultiPV value ${Math.max(humanTrapSettings.multiPv, closeWinSettings.maxCandidates)}`)
+          }
         } catch (err) {
           console.warn('[PvEtrue] Failed to send variant/960 to PvE engine:', err)
         }
@@ -1921,10 +3286,50 @@ export const store = new Vuex.Store({
         context.commit('active', true)
 
         const engineIsWhite = !playerIsWhite
+        let humanTrapRootFen = ''
+        let humanTrapRootLines = []
+
+        const pveInfoHandler = info => {
+          if (!(humanTrapSettings.enabled || closeWinSettings.enabled) || !info || !('pv' in info)) return
+          const rank = Number(info.multipv) || 1
+          const ucimove = typeof info.pv === 'string' ? info.pv.split(/\s+/)[0] : ''
+          if (!ucimove) return
+          humanTrapRootLines[rank - 1] = {
+            multipv: rank,
+            cp: info.cp,
+            mate: info.mate,
+            depth: info.depth,
+            pvUCI: info.pv,
+            ucimove
+          }
+        }
 
         // send position and go to the engine instance
         const sendPositionAndGo = (inst, lim) => {
           try {
+            humanTrapRootFen = context.getters.fen
+            humanTrapRootLines = []
+            if (humanTrapSettings.enabled || closeWinSettings.enabled) {
+              console.info('[Personality]', {
+                humanTrap: humanTrapSettings.enabled,
+                controlledMargin: closeWinSettings.enabled,
+                selectorEntered: true,
+                phase: 'pve-search-start'
+              })
+              if (humanTrapSettings.enabled) console.info('[HumanTrap]', { entered: true, candidates: 0, filtered: 0, probed: 0, selected: 'pending', reason: 'awaiting_root_bestmove' })
+              if (closeWinSettings.enabled) console.info('[ControlledMargin]', { entered: true, bestEval: null, selected: 'pending', reason: 'awaiting_root_bestmove' })
+              context.commit('humanTrapDiagnostics', {
+                mode: 'Engine Personality',
+                type: 'Selector Active',
+                selectorEntered: true,
+                humanTrapEnabled: humanTrapSettings.enabled,
+                controlledMarginEnabled: closeWinSettings.enabled,
+                reason: 'pve_root_search_started',
+                selectedAt: Date.now()
+              })
+            } else {
+              context.commit('humanTrapDiagnostics', null)
+            }
             inst.send(buildPositionCommand(context.getters.gameState))
             inst.send(limiterToGo(lim))
           } catch (err) {
@@ -1939,8 +3344,34 @@ export const store = new Vuex.Store({
 
           if (!context.state.PvE || !engineToMoveNow) return
           try {
-            const move = sanitizeEngineMove(ucimove)
+            let move = sanitizeEngineMove(ucimove)
             if (!move) return
+            if (humanTrapSettings.enabled || closeWinSettings.enabled) {
+              context.commit('enginePersonalityDebug', { trapAttempts: (context.state.enginePersonalityDebug.trapAttempts || 0) + 1 })
+              const currentFen = context.getters.fen
+              const selected = await selectPersonalityMove({
+                engineInstance: pveEngine,
+                fen: humanTrapRootFen || currentFen,
+                variant: context.getters.variant,
+                is960: context.getters.is960,
+                bestmove: move,
+                rootLines: humanTrapRootLines.filter(Boolean),
+                humanTrapSettings,
+                closeWinSettings,
+                sideToMove: turnIsWhite
+              })
+              const stillEngineToMove = ((context.getters.turn && engineIsWhite) || (!context.getters.turn && !engineIsWhite))
+              if (!context.state.PvE || !stillEngineToMove || normalizeFen(context.getters.fen) !== normalizeFen(currentFen)) return
+              if (selected && selected.move && context.state.board.legalMoves().includes(selected.move)) {
+                move = selected.move
+                context.commit('personalityDiagnostics', { ...selected, selectedAt: Date.now() })
+                console.info('[engine-personality] selected', selected)
+              } else if (selected) {
+                context.commit('personalityDiagnostics', { ...selected, selectedAt: Date.now() })
+              } else {
+                context.commit('personalityDiagnostics', null)
+              }
+            }
             await context.dispatch('push', { move, prev: context.getters.currentMove[0] })
           } catch (err) {
             console.error('[PvEMakeMove] Engine provided invalid move:', ucimove, err)
@@ -1950,7 +3381,8 @@ export const store = new Vuex.Store({
           }
         }
 
-        // attach listener
+        // attach listeners
+        if (humanTrapSettings.enabled || closeWinSettings.enabled) pveEngine.on('info', pveInfoHandler)
         pveEngine.on('bestmove', pveEngineHandler)
 
         // kick off the engine if it's the engine's turn now
@@ -2027,7 +3459,7 @@ export const store = new Vuex.Store({
           const turnIsWhite = context.getters.turn
           if (!context.state.EvE || !turnIsWhite) return
           try {
-            const move = sanitizeEngineMove(ucimove)
+            let move = sanitizeEngineMove(ucimove)
             if (!move) return
             await context.dispatch('push', { move, prev: context.getters.currentMove[0] })
             // after white move, trigger black
@@ -2045,7 +3477,7 @@ export const store = new Vuex.Store({
           const turnIsWhite = context.getters.turn
           if (!context.state.EvE || turnIsWhite) return
           try {
-            const move = sanitizeEngineMove(ucimove)
+            let move = sanitizeEngineMove(ucimove)
             if (!move) return
             await context.dispatch('push', { move, prev: context.getters.currentMove[0] })
             // after black move, trigger white
@@ -2109,6 +3541,7 @@ export const store = new Vuex.Store({
       }
       context.commit('PvE', false)
       context.commit('PvEEngineInstance', null)
+      context.commit('humanTrapDiagnostics', null)
       if (!context.getters.turn) {
         context.dispatch('stopEngine')
       } else {
@@ -2116,7 +3549,18 @@ export const store = new Vuex.Store({
         context.commit('active', false)
       }
     },
-    stopEngine (context) {
+    stopEngine (context, payload = {}) {
+      const source = payload && payload.source ? payload.source : 'unknown'
+      console.log('[engine-stop] requested', { source, stack: (new Error('[trace] stopEngine caller')).stack })
+      if (
+        context.state.openingGeneration &&
+        context.state.openingGeneration.running &&
+        context.state.openingGeneration.analysisActive &&
+        source !== 'opening-generation'
+      ) {
+        console.warn('[engine-guard] stopEngine blocked during opening-generation session', { source })
+        return
+      }
       engine.send('stop')
       context.commit('resetEngineTime')
       context.commit('active', false)
@@ -2491,17 +3935,22 @@ export const store = new Vuex.Store({
       context.dispatch('setEngineOptions', options)
     },
     setEngineOptions (context, payload) {
+      const source = payload && payload.__source ? payload.__source : 'unknown'
+      const optionsPayload = { ...(payload || {}) }
+      delete optionsPayload.__source
       console.log('[engine-options] setEngineOptions:requested', {
         activeEngine: context.state.activeEngine,
-        payload
+        source,
+        payload: optionsPayload,
+        stack: (new Error('[trace] setEngineOptions caller')).stack
       })
       if (context.getters.active && !context.getters.PvE) {
-        context.dispatch('stopEngine')
+        context.dispatch('stopEngine', { source: `setEngineOptions:${source}` })
       } else if (context.getters.active && context.getters.PvE && !context.getters.turn) {
-        context.dispatch('stopEngine')
+        context.dispatch('stopEngine', { source: `setEngineOptions:${source}` })
       }
       context.dispatch('resetEngineData')
-      for (const [name, value] of Object.entries(payload)) {
+      for (const [name, value] of Object.entries(optionsPayload)) {
         checkOption(context.state.engineInfo.options, name, value)
         if (value !== undefined && value !== null) {
           if (!filteredSettings.includes(name)) {
@@ -2545,20 +3994,51 @@ export const store = new Vuex.Store({
       if (stats.isEvalCached && stats.depth <= stats.cachedDepth) return
       const targetDepth = context.state.analysisVisualization.analysisTargetDepth
       if (!context.state.deepAnalysis.running && context.state.active && targetDepth !== 'infinite' && Number.isFinite(Number(targetDepth)) && stats.depth >= Number(targetDepth)) {
+        if (context.state.openingGeneration && context.state.openingGeneration.analysisActive) {
+          return
+        }
         context.dispatch('stopEngine')
         context.commit('analysisMode', false)
         return
       }
 
-      // update pvline
+      // update pvline. Display eval is deliberately anchored to root MultiPV #1 only;
+      // speculative/personality candidates remain internal diagnostics and must not move the eval bar.
       if ('pv' in payload) {
-        context.commit('lastAnalysisResult', {
-          cp: typeof payload.cp === 'number' ? payload.cp : context.state.lastAnalysisResult.cp,
-          mate: typeof payload.mate === 'number' ? payload.mate : null,
-          pv: payload.pv || '',
-          ucimove: payload.pv ? payload.pv.split(/\s/)[0] : '',
-          turn: context.state.turn
-        })
+        const rootRank = Number(payload.multipv) || 1
+        if (rootRank === 1) {
+          const rootEval = typeof payload.cp === 'number' ? payload.cp : context.state.lastAnalysisResult.cp
+          context.commit('lastAnalysisResult', {
+            cp: rootEval,
+            mate: typeof payload.mate === 'number' ? payload.mate : null,
+            pv: payload.pv || '',
+            ucimove: payload.pv ? payload.pv.split(/\s/)[0] : '',
+            turn: context.state.turn,
+            displaySource: 'root_multipv_1',
+            displayDepth: payload.depth,
+            displayEval: rootEval,
+            probeEval: null,
+            trapEval: null,
+            marginCandidateEval: null,
+            wdl: Array.isArray(payload.wdl) ? payload.wdl : context.state.lastAnalysisResult.wdl,
+            wdlWin: 'wdlWin' in payload ? payload.wdlWin : context.state.lastAnalysisResult.wdlWin,
+            wdlDraw: 'wdlDraw' in payload ? payload.wdlDraw : context.state.lastAnalysisResult.wdlDraw,
+            wdlLoss: 'wdlLoss' in payload ? payload.wdlLoss : context.state.lastAnalysisResult.wdlLoss
+          })
+          console.info('[DisplayEval]', {
+            rootEval,
+            displayEval: rootEval,
+            source: 'root_multipv_1',
+            depth: payload.depth,
+            pv: payload.pv || ''
+          })
+        } else {
+          console.info('[ProbeEval]', {
+            candidate: typeof payload.cp === 'number' ? payload.cp : null,
+            multipv: rootRank,
+            ignored_for_display: true
+          })
+        }
         const multipv = context.getters.multipv.slice(0)
 
         // handle checkmate
@@ -2630,6 +4110,818 @@ export const store = new Vuex.Store({
     },
     loadedGames (context, payload) {
       context.commit('loadedGames', payload)
+      context.dispatch('rebuildOpeningGraphFromLoadedGames')
+    },
+    rebuildOpeningGraphFromLoadedGames (context) {
+      const graph = createOpeningGraph()
+      const games = Array.isArray(context.state.loadedGames) ? context.state.loadedGames : []
+      for (const game of games) {
+        if (!game || !game.mainlineMoves) continue
+        let variant = (game.headers('Variant') || '').toLowerCase()
+        if (!variant) variant = 'chess'
+        if (!context.getters.variantOptions.revGet(variant) && variant !== 'chess960' && variant !== 'fischerandom') continue
+        let fen = game.headers('FEN')
+        let boardVariant = variant
+        let is960 = false
+        if (variant === 'chess960' || variant === 'fischerandom') {
+          boardVariant = 'chess'
+          is960 = true
+        }
+        let board
+        try {
+          board = fen ? new ffish.Board(boardVariant, fen, is960) : new ffish.Board(boardVariant)
+        } catch (err) {
+          continue
+        }
+        const movesText = String(game.mainlineMoves() || '').trim()
+        const moves = movesText ? movesText.split(/\s+/) : []
+        const positions = [board.fen()]
+        let legal = true
+        for (const uci of moves) {
+          try {
+            board.push(uci)
+            positions.push(board.fen())
+          } catch (err) {
+            legal = false
+            break
+          }
+        }
+        if (legal) addSequenceToOpeningGraph(graph, { moves, positions })
+      }
+      context.commit('openingGraph', graph)
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+    },
+    openingBook (context, payload) {
+      context.commit('openingBook', payload)
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+    },
+    openingStartPool (context, payload) {
+      const list = Array.isArray(payload) ? payload : []
+      const normalized = list
+        .map(item => ({
+          name: String((item && item.name) || '시작 포지션'),
+          variant: String((item && item.variant) || context.state.variant),
+          fen: String((item && item.fen) || '').trim()
+        }))
+        .filter(item => item.variant === context.state.variant)
+      context.state.openingStartPool = normalized
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+    },
+    addCurrentGameToOpeningBook (context) {
+      const graph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+      const moves = context.getters.currentMainlineUci
+      let board
+      try {
+        board = new ffish.Board(context.state.variant, context.state.startFen, context.state.board && context.state.board.is960 && context.state.board.is960())
+      } catch (err) {
+        return
+      }
+      const positions = [board.fen()]
+      for (const uci of moves) {
+        try {
+          board.push(uci)
+          positions.push(board.fen())
+        } catch (err) {
+          break
+        }
+      }
+      addSequenceToOpeningGraph(graph, { moves, positions, source: 'manual' })
+      context.commit('openingGraph', graph)
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+    },
+    playOpeningBookMove (context) {
+      const cfg = context.state.openingBook || {}
+      if (!cfg.enabled) return
+      const candidates = context.getters.openingCandidates || []
+      if (!candidates.length) return
+      const picked = chooseWeightedCandidate(candidates, {
+        topK: cfg.autoResponseTopK || 3,
+        temperature: cfg.autoResponseTemperature || 1,
+        policy: cfg.moveSelectionPolicy || 'practical'
+      })
+      if (!picked || !picked.uci) return
+      const move = picked.uci
+      const current = context.state.moves.find(m => m.fen === context.state.fen)
+      context.commit('appendMoves', { move, prev: current })
+      context.dispatch('fen', context.state.board.fen())
+      context.dispatch('updateBoard')
+      context.dispatch('position')
+    },
+    async runAutoOpeningGeneration (context, payload = {}) {
+      const nextSessionId = (context.state.openingGeneration.sessionId || 0) + 1
+      console.log('[opening-gen] start requested', {
+        variant: context.state.variant,
+        fen: context.state.startFen,
+        overrideStartPool: Array.isArray(payload && payload.startPoolOverride),
+        stopRequested: context.state.openingGeneration && context.state.openingGeneration.stopRequested
+      })
+      context.commit('openingGeneration', {
+        sessionId: nextSessionId,
+        optionSyncKey: '',
+        running: true,
+        stopRequested: false,
+        analysisActive: false,
+        completedGames: 0,
+        completedMoves: 0,
+        currentDepth: 0,
+        currentMove: '',
+        currentStart: '',
+        savedBranches: 0,
+        lastStopReason: '',
+        lastStopDetail: ''
+      })
+      const cfg = context.state.openingBook || {}
+      const setGenerationStop = (reason, detail = '') => {
+        const lastStopDetail = typeof detail === 'string' ? detail : JSON.stringify(detail)
+        context.commit('openingGeneration', { lastStopReason: reason, lastStopDetail })
+        console.log('[opening-gen] stop reason', { reason, detail })
+      }
+      if (!cfg.autoGenerateEnabled) {
+        console.log('[opening-gen] autoGenerateEnabled=false, continuing because manual run was requested')
+      }
+      const iterations = cfg.autoGenerateUnlimited ? Number.MAX_SAFE_INTEGER : Math.max(1, Number(cfg.autoGenerateIterations) || 8)
+      const maxPlies = Math.max(2, Math.min(80, Number(cfg.autoGenerateMaxPlies) || 16))
+      const earlyPlies = Math.max(2, Math.min(maxPlies, Number(cfg.autoGenerateEarlyPlies) || 10))
+      const usePool = cfg.useStartPool !== false
+      const hasOverridePool = Array.isArray(payload && payload.startPoolOverride) && payload.startPoolOverride.length > 0
+      const useStandard16 = !hasOverridePool && cfg.useStandard16OpeningSet === true && ['janggi', 'janggimodern'].includes(context.state.variant)
+      const poolRaw = hasOverridePool
+        ? payload.startPoolOverride
+        : (useStandard16
+          ? janggiStandard16OpeningPositions(context.state.variant)
+          : (usePool && Array.isArray(context.state.openingStartPool) && context.state.openingStartPool.length
+            ? context.state.openingStartPool
+            : [{ variant: context.state.variant, fen: context.state.startFen || '' }]))
+      const pool = poolRaw.filter(item => item && item.variant === context.state.variant)
+      const validPool = []
+      let invalidStartCount = 0
+      for (const item of pool) {
+        try {
+          const board = item.fen ? new ffish.Board(item.variant || context.state.variant, item.fen) : new ffish.Board(item.variant || context.state.variant)
+          validPool.push({ ...item, fen: board.fen() })
+        } catch (err) {
+          invalidStartCount += 1
+          console.warn('[opening-gen] invalid start position skipped', { name: item && item.name, fen: item && item.fen, error: err && err.message })
+        }
+      }
+      if (!validPool.length) {
+        setGenerationStop('invalid_start_position', `No valid start positions (${invalidStartCount} invalid).`)
+        context.commit('openingGeneration', { running: false, stopRequested: false, currentMove: '', currentDepth: 0, currentStart: '' })
+        await context.dispatch('persistOpeningBookFlush')
+        return { generatedGames: 0, generatedMoves: 0 }
+      }
+      let generatedMoves = 0
+      let g = 0
+      const minTrustedCount = Math.max(0, Number(cfg.autoGenerateMinTrustedCount) || 2)
+      while (g < iterations) {
+        console.log('[opening-gen] game-loop begin', { gameIndex: g + 1, iterations })
+        if (context.state.openingGeneration.stopRequested) {
+          setGenerationStop('stop_requested', `Stopped before game ${g + 1}.`)
+          break
+        }
+        const start = useStandard16 && cfg.standard16SelectionMode !== 'random'
+          ? validPool[g % validPool.length]
+          : validPool[Math.floor(Math.random() * validPool.length)]
+        let board
+        try {
+          board = start.fen ? new ffish.Board(start.variant || context.state.variant, start.fen) : new ffish.Board(start.variant || context.state.variant)
+          context.commit('openingGeneration', { currentStart: start.name || board.fen() })
+        } catch (err) {
+          setGenerationStop('invalid_start_position', err && err.message ? err.message : 'Failed to initialize start position.')
+          break
+        }
+        const positions = [board.fen()]
+        const moves = []
+        let plyStopReason = 'max_depth_reached'
+        for (let ply = 0; ply < maxPlies; ply++) {
+          if (context.state.openingGeneration.stopRequested) {
+            plyStopReason = 'stop_requested'
+            setGenerationStop('stop_requested', `Stopped at game ${g + 1}, ply ${ply + 1}.`)
+            break
+          }
+          console.log('[opening-gen] ply begin', { gameIndex: g + 1, ply: ply + 1, fen: board.fen() })
+          const configuredDepth = Number(cfg.autoGenerateDepth)
+          const analysisDepth = Math.max(4, configuredDepth || 12)
+          const usedFallbackDepth = !(Number.isFinite(configuredDepth) && configuredDepth > 0)
+          const analyzed = await context.dispatch('analyzeOpeningGenerationPosition', {
+            fen: board.fen(),
+            variant: context.state.variant,
+            depth: analysisDepth,
+            topK: Math.max(1, Number(cfg.autoGenerateTopK) || 3)
+          })
+          const baseCpThreshold = Math.max(0, Number(cfg.autoGenerateCpThreshold) || 50)
+          // Lower-depth generated analysis is intentionally given a wider best-relative
+          // CP window; higher-depth searches are allowed to prune more strictly.
+          const depthTolerance = analysisDepth < 12 ? 35 : (analysisDepth > 20 ? -15 : 0)
+          const cpThreshold = Math.max(10, baseCpThreshold + depthTolerance)
+          const sortedAnalyzed = (analyzed || []).slice().sort((a, b) => (b.score || -999999) - (a.score || -999999))
+          const bestScore = sortedAnalyzed.length ? Number(sortedAnalyzed[0].score || 0) : null
+          const acceptedRaw = bestScore === null
+            ? []
+            : sortedAnalyzed.filter(c => Number(c.score || -999999) >= (bestScore - cpThreshold))
+          const acceptedTotal = acceptedRaw.reduce((sum, c) => {
+            const delta = Math.max(0, bestScore - Number(c.score || bestScore))
+            return sum + Math.max(0.0001, cpThreshold - delta + 1)
+          }, 0) || 1
+          const acceptedAnalyzed = acceptedRaw.map(c => {
+            const delta = Math.max(0, bestScore - Number(c.score || bestScore))
+            const weight = Math.max(0.0001, cpThreshold - delta + 1)
+            return { ...c, weight, share: weight / acceptedTotal }
+          })
+          console.log('[opening-gen] analysis result', {
+            gameIndex: g + 1, ply: ply + 1, configuredDepth, analysisDepth, usedFallbackDepth,
+            candidateCount: analyzed.length, cpThreshold, bestScore,
+            analyzedScores: sortedAnalyzed.map(c => ({ uci: c.uci, score: c.score })),
+            accepted: acceptedAnalyzed.map(c => ({ uci: c.uci, score: c.score }))
+          })
+          const liveGraph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+          const graphCandidates = openingCandidatesForFen(liveGraph, board.fen(), Math.max(1, Number(cfg.autoGenerateTopK) || 3), {
+            policy: cfg.moveSelectionPolicy || 'practical',
+            explorationStrength: 0.45
+          })
+          const candidates = (acceptedAnalyzed.length ? acceptedAnalyzed : graphCandidates)
+            .map(c => {
+              if (!acceptedAnalyzed.length) return c
+              const known = graphCandidates.find(item => item && item.uci === c.uci)
+              return known
+                ? { ...known, ...c, meta: { ...(known.meta || {}), effectiveCp: c.score }, count: known.count, trustedCount: Math.max(known.trustedCount || 0, minTrustedCount), exploratoryCount: known.exploratoryCount }
+                : { ...c, count: 0, trustedCount: minTrustedCount, exploratoryCount: 0, meta: { effectiveCp: c.score, cpSamples: 0, confidence: 0.25, cpStdDev: 0 } }
+            })
+            .filter(c => (c.trustedCount || 0) >= minTrustedCount)
+          const bestCandidateCp = candidates.reduce((best, c) => {
+            const cp = Number(c && (c.score !== undefined ? c.score : (c.effectiveCp !== undefined ? c.effectiveCp : c.meta && c.meta.effectiveCp)))
+            return Number.isFinite(cp) ? (best === null ? cp : Math.max(best, cp)) : best
+          }, null)
+          const inExploration = cfg.earlyRandomEnabled !== false && ply < earlyPlies
+          const explorationCandidates = applyOpeningExplorationBias(candidates, {
+            bestEffectiveCp: bestCandidateCp,
+            maxCpDelta: cpThreshold,
+            strength: inExploration ? 1 : 0.45,
+            maxBonus: 0.65
+          })
+          console.log('[opening-gen] exploration candidates', {
+            gameIndex: g + 1,
+            ply: ply + 1,
+            mode: inExploration ? 'frontier' : 'reinforce',
+            candidates: explorationCandidates.map(c => ({
+              uci: c.uci,
+              score: c.score,
+              explorationScore: c.explorationScore,
+              explorationBonus: c.exploration && c.exploration.bonus,
+              samples: c.exploration && c.exploration.samples,
+              confidence: c.exploration && c.exploration.confidence,
+              cpDelta: c.exploration && c.exploration.cpDelta,
+              reason: c.exploration && c.exploration.reason
+            }))
+          })
+          let picked = null
+          if (explorationCandidates.length) {
+            picked = chooseWeightedCandidate(explorationCandidates, {
+              topK: inExploration ? (cfg.autoGenerateTopK || 3) : Math.min(2, cfg.autoGenerateTopK || 2),
+              temperature: inExploration ? (cfg.autoGenerateTemperature || 1) : 0.6,
+              policy: cfg.moveSelectionPolicy || 'practical',
+              explorationBias: true
+            })
+          }
+          if (!picked || !picked.uci) {
+            plyStopReason = analyzed.length ? 'no_candidates' : 'engine_no_lines'
+            setGenerationStop(plyStopReason, `Game ${g + 1}, ply ${ply + 1}: analyzed=${analyzed.length}, accepted=${acceptedAnalyzed.length}, candidates=${candidates.length}.`)
+            break
+          }
+          try {
+            const beforeFen = board.fen()
+            let committedCount = 0
+            for (const branch of acceptedAnalyzed) {
+              if (!branch || !branch.uci) continue
+              try {
+                const branchBoard = new ffish.Board(context.state.variant, beforeFen)
+                branchBoard.push(branch.uci)
+                const committedBranch = await context.dispatch('commitGeneratedTransition', { fromFen: beforeFen, toFen: branchBoard.fen(), move: branch.uci, depth: analysisDepth, cp: branch.score, source: 'exploration', sessionId: nextSessionId })
+                if (committedBranch) {
+                  committedCount += 1
+                  context.commit('openingGeneration', { savedBranches: context.state.openingGeneration.savedBranches + 1 })
+                }
+                console.log('[opening-gen] branch decision', { gameIndex: g + 1, ply: ply + 1, move: branch.uci, score: branch.score, accepted: true, committed: committedBranch, continuation: branch.uci === picked.uci })
+              } catch (e) {
+                console.warn('[opening-gen] branch commit failed', { gameIndex: g + 1, ply: ply + 1, move: branch.uci, error: e && e.message })
+              }
+            }
+            board.push(picked.uci)
+            moves.push(picked.uci)
+            positions.push(board.fen())
+            generatedMoves += 1
+            context.commit('openingGeneration', { currentMove: picked.uci })
+            if (!acceptedAnalyzed.length) {
+              const committed = await context.dispatch('commitGeneratedTransition', { fromFen: beforeFen, toFen: board.fen(), move: picked.uci, depth: analysisDepth, cp: picked.score, source: 'exploration', sessionId: nextSessionId })
+              console.log('[opening-gen] commit result', { gameIndex: g + 1, ply: ply + 1, move: picked.uci, committed, committedBranchCount: committedCount })
+              if (committed) {
+                context.commit('openingGeneration', { savedBranches: context.state.openingGeneration.savedBranches + 1 })
+              }
+            }
+          } catch (err) {
+            plyStopReason = 'move_push_failed'
+            setGenerationStop('move_push_failed', `Game ${g + 1}, ply ${ply + 1}: ${err && err.message ? err.message : 'move failed'}`)
+            console.warn('[opening-gen] ply failed', { gameIndex: g + 1, ply: ply + 1, error: err && err.message })
+            break
+          }
+        }
+        if (plyStopReason === 'max_depth_reached' && !context.state.openingGeneration.stopRequested) {
+          setGenerationStop('max_depth_reached', `Game ${g + 1} reached ${maxPlies} plies.`)
+        }
+        g += 1
+        context.commit('openingGeneration', { completedGames: g, completedMoves: generatedMoves })
+        console.log('[opening-gen] game-loop end', { completedGames: g, completedMoves: generatedMoves })
+        if (cfg.autoGenerateUnlimited && g % 200 === 0) {
+          setGenerationStop('batch_checkpoint', `Paused after ${g} generated games for autosave.`)
+          break
+        }
+      }
+      console.log('[opening-gen] finished', { generatedGames: g, generatedMoves, stopRequested: context.state.openingGeneration.stopRequested })
+      context.commit('openingGeneration', { running: false, stopRequested: false, currentMove: '', currentDepth: 0, currentStart: '' })
+      await context.dispatch('persistOpeningBookFlush')
+      return { generatedGames: g, generatedMoves }
+    },
+    runAutoOpeningGenerationFromCurrentPosition (context) {
+      const fen = context.state.board && typeof context.state.board.fen === 'function'
+        ? context.state.board.fen()
+        : context.state.fen
+      if (!fen) return { generatedGames: 0, generatedMoves: 0 }
+      return context.dispatch('runAutoOpeningGeneration', {
+        startPoolOverride: [{
+          name: '현재 포지션',
+          variant: context.state.variant,
+          fen
+        }]
+      })
+    },
+    stopAutoOpeningGeneration (context) {
+      context.commit('openingGeneration', { stopRequested: true })
+    },
+    commitGeneratedTransition (context, payload) {
+      if (payload && payload.sessionId && context.state.openingGeneration && payload.sessionId !== context.state.openingGeneration.sessionId) {
+        console.warn('[opening-gen] stale transition skipped', { move: payload.move, payloadSessionId: payload.sessionId, currentSessionId: context.state.openingGeneration.sessionId })
+        return false
+      }
+      const graph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+      const positions = [payload.fromFen, payload.toFen].filter(Boolean)
+      const moves = [payload.move].filter(Boolean)
+      if (!positions.length || !moves.length) return false
+      const epd = fenToEpd(payload.fromFen)
+      const key = `${epd}|${payload.move}`
+      const beforeCount = Math.max(0, Number((graph.transitions && graph.transitions[key]) || 0))
+      addSequenceToOpeningGraph(graph, {
+        moves,
+        positions,
+        source: payload && payload.source ? payload.source : 'exploration',
+        moveMeta: [{ depth: payload && payload.depth, cp: payload && payload.cp }]
+      })
+      const afterCount = Math.max(0, Number((graph.transitions && graph.transitions[key]) || 0))
+      if (afterCount <= beforeCount) {
+        console.warn('[opening-gen] transition commit produced no count increase', { move: payload.move, beforeCount, afterCount })
+        return false
+      }
+      context.commit('openingGraph', normalizeOpeningGraph(graph))
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+      console.log('[opening-gen] transition committed', { move: payload.move, depth: payload.depth, cp: payload.cp, afterCount })
+      return true
+    },
+    async analyzeOpeningGenerationPosition (context, payload) {
+      const localSessionId = context.state.openingGeneration && context.state.openingGeneration.sessionId
+      const depth = Math.max(4, Number(payload && payload.depth) || 12)
+      const topK = Math.max(1, Number(payload && payload.topK) || 3)
+      const variant = payload.variant || context.state.variant
+      const fen = payload.fen
+      let infoHandler = null
+      let bestMoveHandler = null
+      let reachedDepth = 0
+      let bestmove = ''
+      let bestmoveAtMs = null
+      let lastInfoAtMs = null
+      let lastDepthIncreaseAtMs = null
+      let lastDepthValue = 0
+      let lastNodes = 0
+      let lastNps = 0
+      let depthProgressCount = 0
+      let resolveReason = 'none'
+      let stopReason = 'none'
+      try {
+        console.log('[opening-gen] analyze start', { fen, variant, depth, topK })
+        await context.dispatch('stopEngine', { source: 'opening-generation' })
+        context.dispatch('resetEngineData')
+        const optionSyncKey = `${variant}|${topK}`
+        if (context.state.openingGeneration.optionSyncKey !== optionSyncKey) {
+          await context.dispatch('setEngineOptions', { MultiPV: topK, UCI_Variant: variant, __source: 'opening-generation' })
+          context.commit('openingGeneration', { optionSyncKey })
+        } else {
+          console.log('[opening-gen] option sync skipped (unchanged)', { optionSyncKey })
+        }
+        context.commit('openingGeneration', { analysisActive: true })
+        const board = new ffish.Board(variant, fen)
+        const command = `position fen ${board.fen()}`
+        console.log('[opening-gen] engine cmd', command)
+        const linesByPv = new Map()
+        infoHandler = (info) => {
+          if (!context.state.openingGeneration || context.state.openingGeneration.sessionId !== localSessionId) return
+          if (!info || typeof info !== 'object') return
+          const now = Date.now()
+          lastInfoAtMs = now
+          const curDepth = Number(info.depth || 0)
+          if (curDepth > reachedDepth) {
+            reachedDepth = curDepth
+            lastDepthIncreaseAtMs = now
+            depthProgressCount += 1
+          }
+          if (curDepth > 0) lastDepthValue = curDepth
+          if (typeof info.nodes === 'number') lastNodes = info.nodes
+          if (typeof info.nps === 'number') lastNps = info.nps
+          context.commit('openingGeneration', { currentDepth: curDepth })
+          if (!info.pv) return
+          const ucimove = String(info.pv).split(/\s/)[0]
+          if (!ucimove) return
+          const idx = Math.max(1, Number(info.multipv) || 1)
+          linesByPv.set(idx, {
+            ucimove,
+            cp: typeof info.cp === 'number' ? info.cp : null
+          })
+        }
+        bestMoveHandler = (move) => {
+          if (!context.state.openingGeneration || context.state.openingGeneration.sessionId !== localSessionId) return
+          bestmove = String(move || '')
+          bestmoveAtMs = Date.now()
+        }
+        engine.on('info', infoHandler)
+        engine.on('bestmove', bestMoveHandler)
+        engine.send(command)
+        context.commit('active', true)
+        context.commit('setEngineClock')
+        console.log('[opening-gen] engine cmd', `go depth ${depth}`)
+        engine.send(`go depth ${depth}`)
+        const startedAt = Date.now()
+        lastInfoAtMs = startedAt
+        lastDepthIncreaseAtMs = startedAt
+        const hardTimeoutMs = Math.max(12000, depth * 1500)
+        const softBestmoveWindowMs = Math.max(2500, depth * 220)
+        const depthStallWindowMs = Math.max(2800, depth * 180)
+        const infoSilenceWindowMs = Math.max(2200, depth * 150)
+        while (Date.now() - startedAt < hardTimeoutMs) {
+          if (!context.state.openingGeneration || context.state.openingGeneration.sessionId !== localSessionId) {
+            resolveReason = 'stale-session-ignored'
+            console.warn('[opening-gen] stale session ignored', { localSessionId, currentSessionId: context.state.openingGeneration && context.state.openingGeneration.sessionId, fen })
+            break
+          }
+          if (context.state.openingGeneration.stopRequested) break
+          const elapsedMs = Date.now() - startedAt
+          const depthReached = reachedDepth >= depth
+          const hasLines = linesByPv.size > 0
+          const hasBestmove = Boolean(bestmove)
+          const sinceDepthIncreaseMs = lastDepthIncreaseAtMs === null ? elapsedMs : (Date.now() - lastDepthIncreaseAtMs)
+          const sinceInfoMs = lastInfoAtMs === null ? elapsedMs : (Date.now() - lastInfoAtMs)
+          const bestmoveAgeMs = bestmoveAtMs === null ? null : (Date.now() - bestmoveAtMs)
+          const depthStillIncreasing = sinceDepthIncreaseMs < depthStallWindowMs
+          const infoStillFlowing = sinceInfoMs < infoSilenceWindowMs
+          const nodesGrowing = typeof lastNodes === 'number' && lastNodes > 0
+          const searchingActive = depthStillIncreasing || infoStillFlowing || nodesGrowing
+          if (depthReached && hasLines) {
+            resolveReason = 'requested-depth-reached'
+            console.log('[opening-gen] analyze resolve', { resolveReason, fen, requestedDepth: depth, deepestReportedDepth: reachedDepth, bestmove, elapsedMs, lines: linesByPv.size })
+            return [...linesByPv.entries()].sort((a, b) => a[0] - b[0]).slice(0, topK).map(([, line], idx) => ({
+              uci: line.ucimove,
+              score: typeof line.cp === 'number' ? line.cp : (1000 - idx * 30),
+              trustedCount: 3,
+              depth: reachedDepth || depth
+            }))
+          }
+          if (
+            hasBestmove &&
+            hasLines &&
+            bestmoveAgeMs !== null &&
+            bestmoveAgeMs >= softBestmoveWindowMs &&
+            !searchingActive
+          ) {
+            resolveReason = 'bestmove-before-depth-timeboxed-stalled'
+            console.warn('[opening-gen] analyze early resolve', {
+              resolveReason,
+              fen,
+              requestedDepth: depth,
+              deepestReportedDepth: reachedDepth,
+              bestmove,
+              elapsedMs,
+              lines: linesByPv.size,
+              lastDepthProgressAtMs: lastDepthIncreaseAtMs,
+              depthDelta: reachedDepth - lastDepthValue,
+              sinceDepthIncreaseMs,
+              sinceInfoMs,
+              nodes: lastNodes,
+              nps: lastNps,
+              depthStillIncreasing,
+              infoStillFlowing,
+              searchingActive
+            })
+            return [...linesByPv.entries()].sort((a, b) => a[0] - b[0]).slice(0, topK).map(([, line], idx) => ({
+              uci: line.ucimove,
+              score: typeof line.cp === 'number' ? line.cp : (1000 - idx * 30),
+              trustedCount: 3,
+              depth: reachedDepth || depth
+            }))
+          }
+          if (elapsedMs >= hardTimeoutMs && hasLines) {
+            resolveReason = 'analysis-hard-timeout-with-lines'
+            console.warn('[opening-gen] analyze timeout resolve', {
+              resolveReason,
+              fen,
+              requestedDepth: depth,
+              deepestReportedDepth: reachedDepth,
+              bestmove,
+              elapsedMs,
+              lines: linesByPv.size,
+              lastDepthProgressAtMs: lastDepthIncreaseAtMs,
+              sinceDepthIncreaseMs,
+              sinceInfoMs,
+              nodes: lastNodes,
+              nps: lastNps,
+              depthStillIncreasing,
+              infoStillFlowing,
+              searchingActive,
+              hardTimeoutMs
+            })
+            return [...linesByPv.entries()].sort((a, b) => a[0] - b[0]).slice(0, topK).map(([, line], idx) => ({
+              uci: line.ucimove,
+              score: typeof line.cp === 'number' ? line.cp : (1000 - idx * 30),
+              trustedCount: 3,
+              depth: reachedDepth || depth
+            }))
+          }
+          await new Promise(resolve => setTimeout(resolve, 40))
+        }
+        resolveReason = context.state.openingGeneration.stopRequested ? 'stop-requested' : 'loop-timeout-no-lines'
+      } catch (err) {
+        console.warn('[opening-gen] analyze error', { fen, error: err && err.message })
+        return []
+      } finally {
+        if (infoHandler) engine.off('info', infoHandler)
+        if (bestMoveHandler) engine.off('bestmove', bestMoveHandler)
+        if (context.state.openingGeneration && context.state.openingGeneration.sessionId === localSessionId) {
+          context.commit('openingGeneration', { analysisActive: false })
+        } else {
+          console.warn('[opening-gen] stale session ignored', { localSessionId, currentSessionId: context.state.openingGeneration && context.state.openingGeneration.sessionId, phase: 'cleanup' })
+        }
+        stopReason = resolveReason === 'requested-depth-reached' ? 'normal-final-stop' : 'forced-cleanup-stop'
+        console.log('[opening-gen] analyze cleanup', {
+          fen,
+          resolveReason,
+          stopReason,
+          requestedDepth: depth,
+          deepestReportedDepth: typeof reachedDepth === 'number' ? reachedDepth : null,
+          resolvedBeforeRequestedDepth: reachedDepth < depth,
+          bestmove,
+          bestmoveAtMs
+        })
+        await context.dispatch('stopEngine', { source: 'opening-generation' })
+      }
+      return []
+    },
+    createOpeningBookSnapshot (context) {
+      return {
+        format: 'LIGROUND-OPENING-BOOK',
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        config: context.state.openingBook || {},
+        graph: normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph()),
+        startPool: context.state.openingStartPool || []
+      }
+    },
+    saveOpeningBookSnapshot (context) {
+      const snapshot = {
+        format: 'LIGROUND-OPENING-BOOK',
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        config: context.state.openingBook || {},
+        graph: normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph()),
+        startPool: context.state.openingStartPool || []
+      }
+      localStorage.setItem('openingBookSavedSnapshot', JSON.stringify(snapshot))
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+      return snapshot
+    },
+    loadOpeningBookSnapshot (context) {
+      const raw = localStorage.getItem('openingBookSavedSnapshot') || localStorage.getItem('openingBookAutosave1')
+      if (!raw) return false
+      return context.dispatch('importOpeningBookSnapshot', { text: raw, mode: 'replace' })
+    },
+    importOpeningBookSnapshot (context, payload = {}) {
+      const text = typeof payload === 'string' ? payload : String(payload.text || '')
+      const mode = payload.mode === 'merge' ? 'merge' : 'replace'
+      const raw = text.startsWith('LIGROUND-OPENING-BOOK/') ? text.slice(text.indexOf(String.fromCharCode(10)) + 1) : text
+      let snapshot
+      try {
+        snapshot = JSON.parse(raw)
+      } catch (err) {
+        console.warn('[opening-book] import parse failed', err)
+        return false
+      }
+      const incomingGraph = normalizeOpeningGraph(snapshot.graph || snapshot.openingGraph || snapshot)
+      const nextGraph = mode === 'merge'
+        ? mergeOpeningGraphs(context.state.openingGraph || createOpeningGraph(), incomingGraph)
+        : incomingGraph
+      context.commit('openingGraph', nextGraph)
+      if (mode === 'replace' && snapshot.config && typeof snapshot.config === 'object') context.commit('openingBook', snapshot.config)
+      if (mode === 'replace' && Array.isArray(snapshot.startPool)) context.state.openingStartPool = snapshot.startPool.filter(item => item && (!item.variant || item.variant === context.state.variant))
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+      console.log('[opening-book] imported snapshot', { mode, transitionCount: Object.keys(nextGraph.transitions || {}).length })
+      return true
+    },
+    persistOpeningBook (context) {
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+    },
+    loadOpeningBookFromStorage (context) {
+      try {
+        const graphRaw = localStorage.getItem('openingBookGraph')
+        if (graphRaw) context.commit('openingGraph', normalizeOpeningGraph(JSON.parse(graphRaw)))
+      } catch (err) {
+      // Ignore invalid speculative reply moves from variants with unusual capture rules.
+    }
+      try {
+        const configRaw = localStorage.getItem('openingBookConfig')
+        if (configRaw) context.commit('openingBook', JSON.parse(configRaw))
+      } catch (err) {
+      // Ignore invalid speculative reply moves from variants with unusual capture rules.
+    }
+      try {
+        const poolRaw = localStorage.getItem('openingStartPool')
+        if (poolRaw) {
+          const pool = JSON.parse(poolRaw)
+          context.state.openingStartPool = Array.isArray(pool) ? pool.filter(item => item && item.variant === context.state.variant) : []
+        }
+      } catch (err) {
+      // Ignore invalid speculative reply moves from variants with unusual capture rules.
+    }
+    },
+    clearOpeningBookStorage (context) {
+      context.commit('openingGraph', createOpeningGraph())
+      context.state.openingStartPool = []
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+    },
+    deleteOpeningBookMove (context, payload) {
+      const parentFen = String((payload && payload.parentFen) || '').trim()
+      const move = String((payload && payload.move) || '').trim()
+      if (!parentFen || !move) return false
+      const graph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+      const epd = fenToEpd(parentFen)
+      const node = graph.positions[epd]
+      if (!node || !node.next || !node.next[move]) return false
+      const prevCount = Number(node.next[move] || 0)
+      const nextCount = prevCount - 1
+      if (nextCount > 0) node.next[move] = nextCount
+      else delete node.next[move]
+      if (node.weightNext && node.weightNext[move]) {
+        if (nextCount > 0) {
+          const meta = graph.transitionMeta && graph.transitionMeta[`${epd}|${move}`]
+          const qualityWeight = meta && Number.isFinite(Number(meta.qualityWeight)) ? Number(meta.qualityWeight) : 1
+          node.weightNext[move] = Math.max(0.0001, nextCount * qualityWeight)
+        } else {
+          delete node.weightNext[move]
+        }
+      }
+      if (node.trustedNext && node.trustedNext[move]) {
+        const v = Number(node.trustedNext[move] || 0) - 1
+        if (v > 0) node.trustedNext[move] = v
+        else delete node.trustedNext[move]
+      }
+      if (node.exploratoryNext && node.exploratoryNext[move]) {
+        const v = Number(node.exploratoryNext[move] || 0) - 1
+        if (v > 0) node.exploratoryNext[move] = v
+        else delete node.exploratoryNext[move]
+      }
+      const key = `${epd}|${move}`
+      if (graph.transitions && graph.transitions[key]) {
+        const v = Number(graph.transitions[key] || 0) - 1
+        if (v > 0) graph.transitions[key] = v
+        else delete graph.transitions[key]
+      }
+      if (graph.transitionMeta && graph.transitionMeta[key]) {
+        const meta = graph.transitionMeta[key]
+        if ((meta.trusted || 0) > 0) meta.trusted -= 1
+        else if ((meta.exploratory || 0) > 0) meta.exploratory -= 1
+        if ((meta.trusted || 0) <= 0 && (meta.exploratory || 0) <= 0) delete graph.transitionMeta[key]
+      }
+      graph.moves = Math.max(0, Number(graph.moves || 0) - 1)
+      context.commit('openingGraph', normalizeOpeningGraph(graph))
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+      console.log('[opening-book] move deleted', { parentFen, move, affectedNodeCount: prevCount })
+      return true
+    },
+    cleanupOpeningBookByMinDepth (context, payload) {
+      const minDepth = Math.max(1, Number(payload && payload.minDepth) || 12)
+      const cfg = context.state.openingBook || {}
+      const useQualityFilter = Boolean(payload && payload.useQualityFilter !== undefined ? payload.useQualityFilter : cfg.cleanupUseQualityFilter)
+      const baseCpDelta = Math.max(0, Number((payload && payload.cpDelta) || cfg.cleanupCpDelta) || 120)
+      const graph = normalizeOpeningGraph(context.state.openingGraph || createOpeningGraph())
+      let removedTransitions = 0
+      let removedForDepth = 0
+      let removedForQuality = 0
+      let removedBuckets = 0
+      let preservedManual = 0
+      const removeTransition = (key, reason) => {
+        delete graph.transitionMeta[key]
+        delete graph.transitions[key]
+        removedTransitions += 1
+        if (reason === 'quality') removedForQuality += 1
+        else removedForDepth += 1
+        const splitAt = key.lastIndexOf('|')
+        if (splitAt > 0) {
+          const epd = key.slice(0, splitAt)
+          const move = key.slice(splitAt + 1)
+          const node = graph.positions[epd]
+          if (node) {
+            if (node.next) delete node.next[move]
+            if (node.trustedNext) delete node.trustedNext[move]
+            if (node.exploratoryNext) delete node.exploratoryNext[move]
+            if (node.weightNext) delete node.weightNext[move]
+          }
+        }
+      }
+      for (const key of Object.keys(graph.transitionMeta || {})) {
+        const meta = graph.transitionMeta[key] || {}
+        const isManual = (meta.manualBoost || 0) > 0
+        if (isManual) preservedManual += 1
+        const splitAt = key.lastIndexOf('|')
+        const epd = splitAt > 0 ? key.slice(0, splitAt) : ''
+        const move = splitAt > 0 ? key.slice(splitAt + 1) : ''
+        const node = graph.positions[epd]
+        const buckets = meta.depthBuckets && typeof meta.depthBuckets === 'object' ? meta.depthBuckets : null
+        if (buckets && Object.keys(buckets).length) {
+          for (const depthKey of Object.keys(buckets)) {
+            const depth = Number(depthKey)
+            if (!Number.isFinite(depth) || depth >= minDepth) continue
+            const bucket = buckets[depthKey] || {}
+            const bucketCount = Math.max(0, Number(bucket.count || 0))
+            const trustedRemove = Math.max(0, Number(bucket.trusted || 0))
+            const exploratoryRemove = Math.max(0, Number(bucket.exploratory || 0))
+            delete buckets[depthKey]
+            removedBuckets += 1
+            removedForDepth += bucketCount
+            if (graph.transitions && graph.transitions[key]) graph.transitions[key] = Math.max(0, Number(graph.transitions[key] || 0) - bucketCount)
+            if (node && node.next && node.next[move]) node.next[move] = Math.max(0, Number(node.next[move] || 0) - bucketCount)
+            if (node && node.trustedNext && node.trustedNext[move]) node.trustedNext[move] = Math.max(0, Number(node.trustedNext[move] || 0) - trustedRemove)
+            if (node && node.exploratoryNext && node.exploratoryNext[move]) node.exploratoryNext[move] = Math.max(0, Number(node.exploratoryNext[move] || 0) - exploratoryRemove)
+            meta.trusted = Math.max(0, Number(meta.trusted || 0) - trustedRemove)
+            meta.exploratory = Math.max(0, Number(meta.exploratory || 0) - exploratoryRemove)
+          }
+          if (node && node.next && node.next[move] <= 0) delete node.next[move]
+          if (node && node.trustedNext && node.trustedNext[move] <= 0) delete node.trustedNext[move]
+          if (node && node.exploratoryNext && node.exploratoryNext[move] <= 0) delete node.exploratoryNext[move]
+          if (graph.transitions && graph.transitions[key] <= 0) delete graph.transitions[key]
+          if (Object.keys(buckets).length || isManual) {
+            refreshTransitionMeta(meta)
+            graph.transitionMeta[key] = meta
+            if (node && node.next && node.next[move]) node.weightNext[move] = Math.max(0.0001, Number(node.next[move] || 0) * (meta.qualityWeight || 1))
+          } else {
+            removeTransition(key, 'depth')
+          }
+          continue
+        }
+        const depth = Number(meta.avgDepth || meta.lastDepth || 0)
+        if (!isManual && depth > 0 && depth < minDepth) removeTransition(key, 'depth')
+      }
+      const bestByEpd = {}
+      if (useQualityFilter) {
+        for (const key of Object.keys(graph.transitionMeta || {})) {
+          const meta = graph.transitionMeta[key] || {}
+          const splitAt = key.lastIndexOf('|')
+          if (splitAt <= 0) continue
+          const epd = key.slice(0, splitAt)
+          const cp = Number.isFinite(Number(meta.effectiveCp)) ? Number(meta.effectiveCp) : (Number.isFinite(Number(meta.avgCp)) ? Number(meta.avgCp) : null)
+          if (cp === null) continue
+          bestByEpd[epd] = bestByEpd[epd] === undefined ? cp : Math.max(bestByEpd[epd], cp)
+        }
+        for (const key of Object.keys(graph.transitionMeta || {})) {
+          const meta = graph.transitionMeta[key] || {}
+          if ((meta.manualBoost || 0) > 0) continue
+          const splitAt = key.lastIndexOf('|')
+          const epd = splitAt > 0 ? key.slice(0, splitAt) : ''
+          const bestCp = bestByEpd[epd]
+          const cp = Number.isFinite(Number(meta.effectiveCp)) ? Number(meta.effectiveCp) : (Number.isFinite(Number(meta.avgCp)) ? Number(meta.avgCp) : null)
+          const depth = Number(meta.avgDepth || meta.lastDepth || 0)
+          if (typeof bestCp === 'number' && cp !== null) {
+            const depthTolerance = depth > 20 ? -20 : (depth > 0 && depth < 12 ? 40 : 0)
+            const confidenceTolerance = (meta.confidence || 0) < 0.45 ? 25 : 0
+            const allowedDelta = Math.max(20, baseCpDelta + depthTolerance + confidenceTolerance)
+            if ((bestCp - cp) > allowedDelta) removeTransition(key, 'quality')
+          }
+        }
+      }
+      let removedNodes = 0
+      for (const epd of Object.keys(graph.positions || {})) {
+        const node = graph.positions[epd]
+        if (!node || !node.next || Object.keys(node.next).length > 0) continue
+        delete graph.positions[epd]
+        removedNodes += 1
+      }
+      graph.moves = Object.values(graph.transitions || {}).reduce((sum, v) => sum + Math.max(0, Number(v) || 0), 0)
+      context.commit('openingGraph', normalizeOpeningGraph(graph))
+      context.dispatch('scheduleOpeningBookPersist', { immediate: true })
+      console.log('[opening-book] depth cleanup', { thresholdDepth: minDepth, useQualityFilter, baseCpDelta, removedTransitionCount: removedTransitions, removedBuckets, removedForDepth, removedForQuality, removedNodeCount: removedNodes, preservedManualEntriesCount: preservedManual })
+      return { removedTransitions, removedNodes, preservedManual, minDepth, removedForDepth, removedForQuality, removedBuckets }
     },
     rounds (context, payload) {
       context.commit('rounds', payload)
@@ -2687,6 +4979,25 @@ export const store = new Vuex.Store({
       context.dispatch('updateBoard')
       context.dispatch('setEngineOptions', { UCI_Chess960: is960 })
       context.commit('openedPGN', false)
+    },
+    async loadGameSequence (context, payload) {
+      const variant = payload && payload.variant ? payload.variant : context.state.variant
+      const startFen = payload && payload.startFen ? payload.startFen : ''
+      const moves = Array.isArray(payload && payload.moves) ? payload.moves : []
+      await context.dispatch('variant', variant)
+      if (startFen) {
+        context.commit('newBoard', { fen: startFen, is960: false })
+      } else {
+        context.commit('newBoard')
+      }
+      await context.dispatch('fen', context.state.startFen)
+      let prev
+      for (const move of moves) {
+        context.commit('appendMoves', { move, prev })
+        prev = context.state.moves[context.state.moves.length - 1]
+      }
+      context.dispatch('updateBoard')
+      context.dispatch('position')
     },
     increment (context, payload) {
       context.commit('increment', payload)
@@ -3428,6 +5739,22 @@ export const store = new Vuex.Store({
         is960: state.board && state.board.is960 && state.board.is960()
       }
     },
+    currentMainlineUci (state) {
+      const current = state.moves.find(m => m.fen === state.fen)
+      const anchor = current || state.moves[state.moves.length - 1]
+      return buildMainlineFromMove(anchor).map(move => move.uci)
+    },
+    openingCandidates (state) {
+      if (!state.openingBook || !state.openingBook.enabled) return []
+      const recommendationCount = Math.max(1, Math.min(8, Number(state.openingBook.recommendationCount) || 3))
+      return openingCandidatesForFen(state.openingGraph, state.fen, Math.max(6, recommendationCount), { policy: state.openingBook.moveSelectionPolicy || 'practical' })
+    },
+    openingBook (state) {
+      return state.openingBook
+    },
+    openingStartPool (state) {
+      return (state.openingStartPool || []).filter(item => item && item.variant === state.variant)
+    },
     getMoveByUCIAndPrev (state, uci, prev) {
       return (uci, prev) => state.moves.filter(moves => moves.uci === uci && moves.prev === prev)
       /* const moves = state.moves
@@ -3452,6 +5779,15 @@ export const store = new Vuex.Store({
     },
     PvE (state) {
       return state.PvE
+    },
+    humanTrapDiagnostics (state) {
+      return state.humanTrapDiagnostics
+    },
+    personalityDiagnostics (state) {
+      return state.humanTrapDiagnostics
+    },
+    enginePersonalityDebug (state) {
+      return state.enginePersonalityDebug || {}
     },
     playVsEngineEnabled (state) {
       return state.playVsEngineEnabled
@@ -3570,11 +5906,10 @@ export const store = new Vuex.Store({
       return state.hoveredpv
     },
     cp (state) {
-      if (typeof state.multipv[0].cp === 'number' && (state.multipv[0].pv || typeof state.multipv[0].mate === 'number')) return state.multipv[0].cp
-      return state.lastAnalysisResult.cp
+      return typeof state.lastAnalysisResult.cp === 'number' ? state.lastAnalysisResult.cp : 0
     },
     wdl (state) {
-      return state.multipv[0].wdl
+      return state.lastAnalysisResult.wdl
     },
     depth (state) {
       return state.engineStats.depth || state.lastEngineStats.depth
@@ -3607,15 +5942,14 @@ export const store = new Vuex.Store({
       return state.enginetime
     },
     pv (state) {
-      return state.multipv[0].pv || state.lastAnalysisResult.pv
+      return state.lastAnalysisResult.pv || (state.multipv[0] && state.multipv[0].pv) || ''
     },
     cpForWhite (state) {
-      const hasLiveCp = typeof state.multipv[0].cp === 'number' && (state.multipv[0].pv || typeof state.multipv[0].mate === 'number')
-      return hasLiveCp ? state.multipv[0].cp : state.lastAnalysisResult.cp
+      return typeof state.lastAnalysisResult.cp === 'number' ? state.lastAnalysisResult.cp : 0
     },
     cpForWhiteStr (state, getters) {
       const currentMove = getters.currentMove[0]
-      const mate = typeof state.multipv[0].mate === 'number' ? state.multipv[0].mate : state.lastAnalysisResult.mate
+      const mate = typeof state.lastAnalysisResult.mate === 'number' ? state.lastAnalysisResult.mate : null
 
       // TODO: Update this block when ffish.board.is_terminal() or ffish.board.check_result() is available
       // Temporary fix, as lang as we don't have an `is_terminal()` or `check_result` function
@@ -3646,7 +5980,7 @@ export const store = new Vuex.Store({
     },
     cpForWhitePerc (state, getters) {
       const currentMove = getters.currentMove[0]
-      const mate = typeof state.multipv[0].mate === 'number' ? state.multipv[0].mate : state.lastAnalysisResult.mate
+      const mate = typeof state.lastAnalysisResult.mate === 'number' ? state.lastAnalysisResult.mate : null
       if (typeof mate === 'number') {
         return (Math.sign(mate) + 1) / 2
       } else if (currentMove && currentMove.name.includes('#')) {
@@ -3657,9 +5991,8 @@ export const store = new Vuex.Store({
     },
     cpForBarPerc (state, getters) {
       const currentMove = getters.currentMove[0]
-      const liveHasPv = Boolean(state.multipv[0] && (state.multipv[0].pv || typeof state.multipv[0].mate === 'number'))
-      const effectiveTurn = liveHasPv ? state.turn : (typeof state.lastAnalysisResult.turn === 'boolean' ? state.lastAnalysisResult.turn : state.turn)
-      const mate = typeof state.multipv[0].mate === 'number' ? state.multipv[0].mate : state.lastAnalysisResult.mate
+      const effectiveTurn = typeof state.lastAnalysisResult.turn === 'boolean' ? state.lastAnalysisResult.turn : state.turn
+      const mate = typeof state.lastAnalysisResult.mate === 'number' ? state.lastAnalysisResult.mate : null
       if (typeof mate === 'number') {
         // Bar visualization uses fixed board-side perspective (Cho positive),
         // normalized from transient side-to-move engine outputs.
@@ -3667,24 +6000,12 @@ export const store = new Vuex.Store({
       } else if (currentMove && currentMove.name.includes('#')) {
         return state.turn ? 0 : 1
       }
-      const liveCpRaw = typeof state.multipv[0].cp === 'number' ? state.multipv[0].cp : null
-      const lastCpRaw = typeof state.lastAnalysisResult.cp === 'number' ? state.lastAnalysisResult.cp : null
-      const liveCpStable = liveCpRaw === null ? null : calcForSide(liveCpRaw, state.turn)
-      const lastCpStable = lastCpRaw === null ? null : calcForSide(lastCpRaw, typeof state.lastAnalysisResult.turn === 'boolean' ? state.lastAnalysisResult.turn : state.turn)
-
-      let stableCp = calcForSide(getters.cpForWhite, effectiveTurn)
-      // Live search can temporarily emit opposite-perspective scores.
-      // Keep bar perspective stable by anchoring sign to last completed analysis when signs conflict.
-      if (liveHasPv && liveCpStable !== null) {
-        stableCp = liveCpStable
-        if (lastCpStable !== null && Math.sign(liveCpStable) !== 0 && Math.sign(lastCpStable) !== 0 && Math.sign(liveCpStable) !== Math.sign(lastCpStable)) {
-          stableCp = Math.sign(lastCpStable) * Math.abs(liveCpStable)
-        }
-      }
+      const rootCpRaw = typeof state.lastAnalysisResult.cp === 'number' ? state.lastAnalysisResult.cp : 0
+      const stableCp = calcForSide(rootCpRaw, effectiveTurn)
       return 1 / (1 + Math.exp(-0.003 * stableCp))
     },
     wdlForWhiteWin (state) {
-      const wdl = normalizeWdl(state.multipv[0])
+      const wdl = normalizeWdl(state.lastAnalysisResult)
       if (wdl) {
         const win = state.turn ? wdl.win : wdl.loss
         state.lastWdlWin = win
@@ -3693,7 +6014,7 @@ export const store = new Vuex.Store({
       return state.lastWdlWin
     },
     wdlForWhiteDraw (state) {
-      const wdl = normalizeWdl(state.multipv[0])
+      const wdl = normalizeWdl(state.lastAnalysisResult)
       if (wdl) {
         state.lastWdlDraw = wdl.draw
         return wdl.draw
@@ -3701,7 +6022,7 @@ export const store = new Vuex.Store({
       return state.lastWdlDraw
     },
     wdlForWhiteLoss (state) {
-      const wdl = normalizeWdl(state.multipv[0])
+      const wdl = normalizeWdl(state.lastAnalysisResult)
       if (wdl) {
         const loss = state.turn ? wdl.loss : wdl.win
         state.lastWdlLoss = loss
