@@ -1,9 +1,18 @@
 <template>
   <!-- All components but menubar -->
   <div id="inner">
+    <button
+      v-if="focusMode"
+      class="focus-mode-exit"
+      type="button"
+      title="Exit Focus Mode (Esc)"
+      @click="exitFocusMode"
+    >
+      Exit Focus Mode
+    </button>
     <div>
       <div
-        class="main-grid"
+        :class="['main-grid', { 'focus-mode': focusMode }]"
         @wheel.exact="routeWheelToRightPanel"
       >
         <div class="chessboard-grid">
@@ -38,6 +47,7 @@
               </div>
               <EvalBar
                 v-if="QuickTourIndex !== 3"
+                v-show="!focusMode"
                 class="evalbar"
               />
               <EvalBar
@@ -71,6 +81,24 @@
               @click="copySequence"
             >
               전체 수순 복사
+            </button>
+            <button
+              class="mini-btn"
+              @click="copyWinBoardSequence"
+            >
+              WinBoard 전체 수순 복사
+            </button>
+            <button
+              class="mini-btn"
+              @click="copyWinBoardPosition"
+            >
+              WinBoard Position Copy
+            </button>
+            <button
+              class="mini-btn"
+              @click="pasteWinBoardPosition"
+            >
+              WinBoard Position Paste
             </button>
             <button
               class="mini-btn"
@@ -180,13 +208,14 @@
         </div>
         <EvalPlot
           v-if="QuickTourIndex !== 6"
+          v-show="!focusMode"
           id="evalplot"
         />
         <EvalPlot
           v-else
           id="evalplot-qt"
         />
-        <div id="right-column">
+        <div v-show="!focusMode" id="right-column">
           <AnalysisView
             id="analysisview"
             class="tab"
@@ -220,6 +249,7 @@ import SettingsTab from './SettingsTab'
 import GameInfo from './GameInfo.vue'
 import { findBestOpeningForFen } from '../../shared/openingLookup'
 import { parseGameSequence, serializeGameSequence } from '../../shared/gameSequence'
+import { deserializeWinBoardFen, serializeWinBoardFen, serializeWinBoardGame } from '../../shared/winboardExport'
 import { copyTextReliable, readTextReliable } from '../../shared/clipboard'
 import { mapGetters } from 'vuex'
 
@@ -292,14 +322,23 @@ export default {
     showOpeningSuggestions () {
       return this.openingBook.enabled && this.openingBook.showSuggestions && this.openingCandidates.length > 0
     },
+    focusMode () {
+      return this.$store.getters.focusMode
+    },
     ...mapGetters(['QuickTourIndex'])
   },
   mounted () { // EventListener für Keyboardinput, ruft direkt die jeweilige Methode auf
+    console.log('[FocusMode] UI updated', { focusMode: this.focusMode })
     this.keydownHandler = (event) => {
       const keyName = event.key
       const target = event.target
       const tag = target && target.nodeName ? target.nodeName.toLowerCase() : ''
       const isEditable = target && (target.isContentEditable || tag === 'textarea' || tag === 'select' || (tag === 'input' && target.type.toLowerCase() !== 'checkbox'))
+      if (keyName === 'Escape' && this.focusMode) {
+        event.preventDefault()
+        this.exitFocusMode()
+        return
+      }
       if (!isEditable) {
         if (keyName === 'ArrowUp') {
           event.preventDefault()
@@ -369,6 +408,11 @@ export default {
   watch: {
     fen () {
       this.tryAutoOpeningResponse()
+    },
+    focusMode (value) {
+      this.$nextTick(() => {
+        console.log('[FocusMode] UI updated', { focusMode: value })
+      })
     }
   },
   beforeDestroy () {
@@ -377,6 +421,10 @@ export default {
     }
   },
   methods: {
+    exitFocusMode () {
+      console.log('[FocusMode] Exit requested')
+      this.$store.dispatch('focusMode', false)
+    },
     setFenSize () {
       return this.fen.length + 3
     },
@@ -628,6 +676,42 @@ export default {
         return
       }
       alert('복사에 실패했습니다. 다른 창을 닫고 다시 시도해 주세요.')
+    },
+    async copyWinBoardSequence () {
+      const text = serializeWinBoardGame({
+        fen: this.$store.getters.fen,
+        moves: this.$store.getters.currentMainlineUci,
+        includeBoardDump: true
+      })
+      const result = await copyTextReliable(text)
+      if (result.ok) {
+        alert('WinBoard 전체 대국 수순을 복사했습니다.')
+        return
+      }
+      alert('복사에 실패했습니다. 다른 창을 닫고 다시 시도해 주세요.')
+    },
+    async copyWinBoardPosition () {
+      const text = serializeWinBoardFen(this.$store.getters.fen)
+      const result = await copyTextReliable(text)
+      if (result.ok) {
+        alert('WinBoard 현재 포지션을 복사했습니다.')
+        return
+      }
+      alert('복사에 실패했습니다. 다른 창을 닫고 다시 시도해 주세요.')
+    },
+    async pasteWinBoardPosition () {
+      const read = await readTextReliable()
+      if (!read.ok) {
+        alert('클립보드를 읽지 못했습니다.')
+        return
+      }
+      const fen = deserializeWinBoardFen(read.text)
+      const ok = await this.$store.dispatch('loadWinBoardPosition', fen)
+      if (ok) {
+        alert('WinBoard 포지션을 불러왔습니다.')
+        return
+      }
+      alert('유효한 WinBoard/Fairy-Stockfish 장기 포지션이 아닙니다.')
     },
     async pasteSequence () {
       const read = await readTextReliable()
@@ -916,6 +1000,51 @@ input {
 #evalbutton-style {
   margin-top: 10px;
   grid-area: evalButton;
+}
+
+.focus-mode-exit {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 1000;
+  padding: 8px 12px;
+  border: 1px solid #1f6f45;
+  border-radius: 6px;
+  background: #2f855a;
+  color: #fff;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+}
+
+.focus-mode-exit:focus,
+.focus-mode-exit:hover {
+  background: #276749;
+}
+
+.main-grid.focus-mode {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto;
+  grid-template-areas: "chessboard";
+  justify-items: center;
+  align-items: start;
+  padding-right: 0;
+}
+.main-grid.focus-mode .chessboard-grid {
+  width: min(96vw, 980px);
+}
+.main-grid.focus-mode .board {
+  grid-template-areas:
+    "gameinfo"
+    "scrollable";
+  justify-items: center;
+  row-gap: 10px;
+}
+.main-grid.focus-mode #fen-field,
+.main-grid.focus-mode #fen-field-qt,
+.main-grid.focus-mode .game-sequence-row,
+.main-grid.focus-mode .opening-candidates {
+  display: none;
 }
 
 @media (max-width: 1100px) {

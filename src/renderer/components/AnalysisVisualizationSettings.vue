@@ -1,10 +1,11 @@
 <template>
   <div class="viz-settings">
-    <h4>시각화</h4>
+    <div class="section-head" @click="toggleSection('visualization')"><span>{{ sectionArrow('visualization') }}</span> Visualization</div>
+    <template v-if="expandedSections.visualization">
     <label><input v-model="local.showMultiPvArrows" type="checkbox" @change="save"> 후보수 화살표</label>
     <label><input v-model="humanTrapMode" type="checkbox"> Human Trap Mode</label>
     <label><input v-model="closeWinMode" type="checkbox"> Controlled Margin Mode</label>
-    <small>Human Trap은 분석/추천/엔진 선택에 실전 함정 압력을 반영합니다. Controlled Margin은 작은 목표 우세권(+0.7~+1.3) 안에서 승리 마진을 조절합니다. 둘 다 기본값은 꺼짐입니다.</small>
+    <small>Human Trap은 분석/추천/엔진 선택에 실전 함정 압력을 반영합니다. Controlled Margin은 작은 목표 우세권(+0.7~+1.3) 안에서 승리 마진을 조절합니다. Pressure/Hunter/Closer는 실수방지 모드 패널로 이동했습니다.</small>
     <label>표시 후보 수 <input v-model.number="local.multiPvCount" min="1" type="number" @change="save"></label>
     <label><input v-model="local.trajectoryEnabled" type="checkbox" @change="save"> 최선 수순 궤적</label>
     <label>표시 방향
@@ -19,8 +20,9 @@
     <label><input v-model="local.orderNumbers" type="checkbox" @change="save"> 순번 표시</label>
     <label><input v-model="local.orderThickness" type="checkbox" @change="save"> 두께 반영</label>
     <label><input v-model="local.orderOpacity" type="checkbox" @change="save"> 투명도 반영</label>
-    <label>일반 분석 목표 깊이
-      <select v-model="targetDepth" @change="saveTarget"><option value="infinite">무제한</option><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="25">25</option></select>
+
+    <label>분석 목표 깊이
+      <select v-model="targetDepth" @change="saveTarget"><option value="infinite">무제한</option><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="25">25</option><option value="30">30</option><option value="35">35</option><option value="40">40</option></select>
     </label>
 
     <details class="deep-advanced">
@@ -49,6 +51,7 @@
       <small>켜면 임시 수순이나 현재 기보 흐름이 잠시 멈춘 뒤 자동으로 엔진 리뷰를 반영합니다. 화살표 옵션은 실시간 전략 해설이 만든 표시만 조절하며 일반 엔진/수순 리뷰 표시는 유지됩니다.</small>
       <small>깊게/전문가 모드는 느리지만 지연 전술, 장기 압박, 응징 수순을 더 오래 추적합니다.</small>
     </details>
+    </template>
 
     <div class="deep-box">
       <h4>분석 모드</h4>
@@ -83,8 +86,8 @@
     </div>
 
     <div class="deep-box">
-      <h4>오프닝북</h4>
-      <label><input v-model="openingBookLocal.enabled" type="checkbox" @change="saveOpeningBook"> 오프닝북 사용</label>
+      <div class="section-head" @click="toggleSection('openingBook')"><span>{{ sectionArrow('openingBook') }}</span> Opening Book <b>[{{ openingBookLocal.enabled ? 'ON' : 'OFF' }}]</b> <label class="inline-toggle" @click.stop><input v-model="openingBookLocal.enabled" type="checkbox" @change="saveOpeningBook"> ON</label></div>
+      <template v-if="expandedSections.openingBook">
       <label><input v-model="openingBookLocal.showSuggestions" type="checkbox" @change="saveOpeningBook"> 추천 수 표시</label>
       <label>추천 표시 개수 <input v-model.number="openingBookLocal.recommendationCount" min="1" max="8" type="number" @change="saveOpeningBook"></label>
       <label><input v-model="openingBookLocal.autoResponse" type="checkbox" @change="saveOpeningBook"> 자동 응수 사용</label>
@@ -162,6 +165,7 @@
       <small>저장된 분기 수: {{ openingGeneration.savedBranches || 0 }}</small>
       <small>마지막 종료 사유: {{ openingGeneration.lastStopReason || '-' }}</small>
       <small v-if="openingGeneration.lastStopDetail">상세: {{ openingGeneration.lastStopDetail }}</small>
+      </template>
     </div>
 
     <div v-if="deepAnalysis.error" class="deep-error">
@@ -214,7 +218,7 @@ import { copyTextReliable } from '../../shared/clipboard'
 
 export default {
   name: 'AnalysisVisualizationSettings',
-  data: () => ({ local: {}, depthMode: '12', targetDepth: 'infinite', openingBookLocal: {}, poolBulkText: '', cleanupMinDepth: 12, pendingImportMode: 'replace' }),
+  data: () => ({ local: {}, depthMode: '12', targetDepth: '15', openingBookLocal: {}, poolBulkText: '', cleanupMinDepth: 12, pendingImportMode: 'replace', expandedSections: {} }),
   computed: {
     cfg () { return this.$store.getters.analysisVisualization },
     deepAnalysis () { return this.$store.getters.deepAnalysis },
@@ -230,6 +234,18 @@ export default {
     closeWinMode: {
       get () { return !!(this.$store.state.startGameModal && this.$store.state.startGameModal.closeWinMode) },
       set (value) { this.$store.commit('startGameModal', { closeWinMode: !!value }) }
+    },
+    pressureMode: {
+      get () { return !!(this.$store.state.startGameModal && this.$store.state.startGameModal.pressureMode) },
+      set (value) { this.$store.commit('startGameModal', { pressureMode: !!value }) }
+    },
+    hunterMode: {
+      get () { return !!(this.$store.state.startGameModal && this.$store.state.startGameModal.hunterMode) },
+      set (value) { this.$store.commit('startGameModal', { hunterMode: !!value }) }
+    },
+    closerMode: {
+      get () { return !!(this.$store.state.startGameModal && this.$store.state.startGameModal.closerMode) },
+      set (value) { this.$store.commit('startGameModal', { closerMode: !!value }) }
     }
   },
   watch: {
@@ -239,7 +255,7 @@ export default {
       handler () {
         this.local = { ...this.cfg }
         this.depthMode = this.cfg.trajectoryUnlimited ? 'unlimited' : String(this.cfg.trajectoryDepth)
-        this.targetDepth = this.cfg.analysisTargetDepth || 'infinite'
+        this.targetDepth = this.cfg.analysisTargetDepth || '15'
       }
     },
     openingBook: {
@@ -251,6 +267,8 @@ export default {
     }
   },
   methods: {
+    toggleSection (key) { this.$set(this.expandedSections, key, !this.expandedSections[key]) },
+    sectionArrow (key) { return this.expandedSections[key] ? '▼' : '▶' },
     save () {
       this.$store.dispatch('analysisVisualization', this.local)
       if (typeof this.local.multiPvCount === 'number' && this.local.multiPvCount > 0) {
@@ -440,12 +458,16 @@ export default {
 </script>
 <style scoped>
 .viz-settings { margin: 8px 0; padding: 8px; background: var(--second-bg-color); border-radius: 6px; font-size: 12px; color: var(--main-text-color); display:flex; flex-direction:column; gap:6px; }
+.section-head { padding: 7px 9px; border-radius: 6px; background: rgba(127,127,127,.16); cursor: pointer; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.inline-toggle { margin-left: auto; font-weight: 400; }
 label { display:flex; justify-content:space-between; gap:8px; align-items:center; }
 input[type="number"], select { max-width: 130px; background: var(--main-bg-color); color: var(--main-text-color); border: 1px solid var(--main-border-color); border-radius: 3px; }
 h4 { margin: 0 0 4px 0; }
 button { border: none; border-radius: 4px; padding: 6px 8px; background: #7289da; color: white; cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.6; }
 small { color: var(--second-text-color, #9aa0a6); overflow-wrap: anywhere; }
+.personality-box { display: flex; flex-direction: column; gap: 6px; margin: 4px 0; padding: 8px; border: 1px solid var(--main-border-color); border-radius: 4px; background: rgba(127,127,127,0.08); }
+.personality-box h4 { margin: 0 0 2px 0; }
 .deep-box { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--main-border-color); }
 .radio-row { justify-content: flex-start; }
 .deep-error { padding: 6px; border-left: 4px solid #d7263d; background: rgba(215, 38, 61, 0.18); }

@@ -50,6 +50,14 @@
       >
         📋 PGN Browser
       </button>
+      <button
+        class="focusModeBtn"
+        :class="{ active: focusMode }"
+        title="Toggle distraction-free board view"
+        @click="toggleFocusMode"
+      >
+        {{ focusMode ? 'Focus Mode ON' : 'Focus Mode OFF' }}
+      </button>
     </div>
 
     <!-- Mode Selection -->
@@ -265,6 +273,7 @@ export default {
       showPgnModal: false, // controls visibility of the PGN browser modal
       autoPlayEnabled: false,
       autoPlayTimer: null,
+      autoPlayInFlight: false,
       playVsEngineEnabled: false,
       playVsEngineHumanSide: 'white',
       engineTimeControlsEnabled: false,
@@ -291,7 +300,7 @@ export default {
     displayVariant () { // retuns the "nice" name of the current variant
       return this.variantOptions.revGet(this.variant)
     },
-    ...mapGetters(['QuickTourIndex', 'gameConfig', 'showGameEndModal']),
+    ...mapGetters(['QuickTourIndex', 'gameConfig', 'showGameEndModal', 'focusMode']),
     showGameEndModal () {
       return this.$store.getters.showGameEndModal
     },
@@ -308,10 +317,21 @@ export default {
       }
     }
   },
+  mounted () {
+    this.engineTimeControlsEnabled = this.$store.getters.engineTimeControlsEnabled || false
+    this.engineTimeControlMode = this.$store.getters.engineTimeControlMode || this.engineTimeControlMode
+  },
   beforeDestroy () {
     if (this.autoPlayTimer) {
       clearInterval(this.autoPlayTimer)
       this.autoPlayTimer = null
+    }
+  },
+  watch: {
+    focusMode (value) {
+      this.$nextTick(() => {
+        console.log('[FocusMode] UI updated', { focusMode: value, label: value ? 'Focus Mode ON' : 'Focus Mode OFF' })
+      })
     }
   },
   methods: {
@@ -330,6 +350,7 @@ export default {
           await this.$store.dispatch('EvEfalse')
         } catch (e) {}
         try {
+          this.autoPlayInFlight = false
           await this.$store.dispatch('stopEngine')
         } catch (e) {}
 
@@ -351,6 +372,13 @@ export default {
 
     openStartModal () {
       this.showStartModal = true
+    },
+
+    toggleFocusMode () {
+      const nextFocusMode = !this.focusMode
+      console.log('[FocusMode] Button clicked', { previous: this.focusMode, next: nextFocusMode })
+      console.log('[FocusMode] Vue method called', { next: nextFocusMode })
+      this.$store.dispatch('focusMode', nextFocusMode)
     },
 
     closeStartModal () {
@@ -414,10 +442,10 @@ export default {
       await this.$store.dispatch('PvEfalse')
       await this.$store.dispatch('analyzePosition')
     },
-    async engineMove () {
+    async engineMove (payload = {}) {
       await this.$store.dispatch('EvEfalse')
       await this.$store.dispatch('PvEfalse')
-      await this.$store.dispatch('playSingleEngineMove')
+      await this.$store.dispatch('playSingleEngineMove', payload)
     },
     async toggleEngineAutoPlay () {
       this.autoPlayEnabled = !this.autoPlayEnabled
@@ -426,12 +454,18 @@ export default {
           clearInterval(this.autoPlayTimer)
           this.autoPlayTimer = null
         }
+        this.autoPlayInFlight = false
         await this.$store.dispatch('stopEngine')
         return
       }
       this.autoPlayTimer = setInterval(async () => {
-        if (!this.autoPlayEnabled) return
-        await this.engineMove()
+        if (!this.autoPlayEnabled || this.autoPlayInFlight) return
+        this.autoPlayInFlight = true
+        try {
+          await this.engineMove({ engineAutoPlay: true })
+        } finally {
+          this.autoPlayInFlight = false
+        }
       }, 250)
     },
     togglePlayVsEngine () {
@@ -696,6 +730,15 @@ export default {
   align-items: center;
 }
 
+.focusModeBtn {
+  min-width: 118px;
+}
+
+.focusModeBtn.active {
+  background: #2f855a;
+  color: #fff;
+}
+
 #evalplot-button {
   display: flex;
   gap: 8px;
@@ -705,6 +748,7 @@ export default {
   border: 1px solid var(--main-border-color, #ddd);
   border-radius: 5px;
 }
+
 
 #evalplot-button-qt {
   display: flex;
